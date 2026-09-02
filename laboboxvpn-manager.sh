@@ -44,7 +44,13 @@ load_config() {
 
 # Sauvegarder la configuration
 save_config() {
-    cat > "$CONFIG_FILE" << EOF
+    # Le fichier vit dans INSTALL_DIR, qui n'existe pas encore lors de la
+    # toute première configuration (dans le menu, « Configurer le réseau »
+    # passe AVANT « Initialiser le système ») : on crée le dossier au lieu
+    # d'échouer. Retourne 1 si l'écriture est impossible — l'appelant ne
+    # doit pas annoncer une sauvegarde qui n'a pas eu lieu.
+    mkdir -p "$INSTALL_DIR" 2>/dev/null
+    cat > "$CONFIG_FILE" << EOF || return 1
 # Configuration LaboBox-VPN Manager - Généré automatiquement
 # Ne pas modifier manuellement
 
@@ -2675,8 +2681,17 @@ cmd_config_network() {
     fi
     
     echo ""
-    
-    if [ $changes_made -eq 0 ]; then
+
+    # La config stockée doit-elle être (ré)écrite ? Au premier lancement,
+    # une valeur affichée « (inchangé) » (IP ou port SSH détectés) n'a
+    # encore JAMAIS été enregistrée dans laboboxvpn.conf : sans cette
+    # écriture, is_network_configured() reste faux et bloque l'init.
+    local config_changed=0
+    [ -n "$input_server_ip" ] && [ "$SERVER_IP" != "$input_server_ip" ] && config_changed=1
+    [ -n "$input_ssh_port" ] && [ "$SSH_PORT" != "$input_ssh_port" ] && config_changed=1
+    [ -n "$input_nas_ip" ] && [ "$NAS_IP" != "$input_nas_ip" ] && config_changed=1
+
+    if [ $changes_made -eq 0 ] && [ $config_changed -eq 0 ]; then
         echo -e "  ${DIM}Aucune modification à appliquer.${NC}"
         print_footer
         return 0
@@ -2701,11 +2716,19 @@ cmd_config_network() {
     # Appliquer les modifications
     local need_network_restart=0
     local need_ssh_restart=0
-    
+
+    # Persister TOUTES les valeurs acceptées — y compris celles affichées
+    # « (inchangé) » : la valeur détectée (IP de la VM, port SSH) doit finir
+    # dans laboboxvpn.conf même quand le système, lui, n'a rien à changer.
+    local old_nas_ip="$NAS_IP"
+    [ -n "$input_server_ip" ] && SERVER_IP="$input_server_ip"
+    [ -n "$input_ssh_port" ] && SSH_PORT="$input_ssh_port"
+    [ -n "$input_nas_ip" ] && NAS_IP="$input_nas_ip"
+
     # 1. Modifier l'IP dans /etc/network/interfaces
     if [ "$input_server_ip" != "$current_ip" ] && [ -n "$input_server_ip" ]; then
         echo -e "  ${DIM}Modification de /etc/network/interfaces...${NC}"
-        
+
         if [ -f /etc/network/interfaces ]; then
             sed -i "s/address ${current_ip}/address ${input_server_ip}/g" /etc/network/interfaces
             need_network_restart=1
@@ -2713,14 +2736,12 @@ cmd_config_network() {
         else
             echo -e "  ${RED}✗ Fichier /etc/network/interfaces non trouvé${NC}"
         fi
-        
-        SERVER_IP="$input_server_ip"
     fi
-    
+
     # 2. Modifier le port SSH
     if [ "$input_ssh_port" != "$current_ssh_port" ]; then
         echo -e "  ${DIM}Modification de /etc/ssh/sshd_config...${NC}"
-        
+
         if [ -f /etc/ssh/sshd_config ]; then
             if grep -q "^Port " /etc/ssh/sshd_config; then
                 sed -i "s/^Port .*/Port ${input_ssh_port}/" /etc/ssh/sshd_config
@@ -2734,19 +2755,19 @@ cmd_config_network() {
         else
             echo -e "  ${RED}✗ Fichier /etc/ssh/sshd_config non trouvé${NC}"
         fi
-        
-        SSH_PORT="$input_ssh_port"
     fi
-    
+
     # 3. Modifier l'IP du NAS
-    if [ "$input_nas_ip" != "$NAS_IP" ] && [ -n "$input_nas_ip" ]; then
-        NAS_IP="$input_nas_ip"
-        echo -e "  ${GREEN}✔ IP NAS enregistrée : ${input_nas_ip}${NC}"
+    if [ "$NAS_IP" != "$old_nas_ip" ]; then
+        echo -e "  ${GREEN}✔ IP NAS enregistrée : ${NAS_IP}${NC}"
     fi
     
     # Sauvegarder la configuration
-    save_config
-    echo -e "  ${GREEN}✔ Configuration sauvegardée dans ${CONFIG_FILE}${NC}"
+    if save_config; then
+        echo -e "  ${GREEN}✔ Configuration sauvegardée dans ${CONFIG_FILE}${NC}"
+    else
+        echo -e "  ${RED}✗ Impossible d'écrire ${CONFIG_FILE} — configuration NON sauvegardée${NC}"
+    fi
     
     echo ""
     
