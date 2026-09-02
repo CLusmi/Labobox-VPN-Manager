@@ -761,8 +761,10 @@ EOF
         msg_warn "Contrôle de congestion actif : ${active_cc:-inconnu}"
     fi
 
-    # Tuning NIC immédiat (le même script sera rejoué à chaque boot)
-    "$NIC_TUNE_FILE" 2>/dev/null || true
+    # Tuning NIC immédiat (le même script sera rejoué à chaque boot).
+    # Sa sortie, pensée pour le journal systemd, est réalignée sur la marge
+    # de l'interface quand elle s'affiche ici.
+    "$NIC_TUNE_FILE" 2>/dev/null | sed 's/^/  /' || true
     msg_ok "Tuning carte réseau appliqué (offloads, UDP-GRO forwarding, files)."
 
     # irqbalance : désactivé quand le script fixe lui-même l'affinité des IRQ
