@@ -99,16 +99,17 @@ print_section() {
     echo ""
 }
 
-print_kv() {
-    printf "    %-16s ${C_GREEN}%s${C_NC}\n" "$1" "$2"
-}
-
 # Question oui/non avec valeur par défaut. ask_yn "Question ?" "o" → 0 si oui.
 ask_yn() {
     local prompt="$1" default="${2:-n}" reply
     local hint="o/N"; [[ "$default" == "o" ]] && hint="O/n"
     printf '%s%s (%s) : ' "$MARGIN" "$prompt" "$hint"
-    read -r reply || true
+    if ! read -r reply; then
+        # Fin d'entrée (stdin fermé, usage non interactif) : ne JAMAIS
+        # valider par défaut une modification système — --yes existe pour ça.
+        echo ""
+        return 1
+    fi
     reply="${reply:-$default}"
     [[ "$reply" =~ ^[oOyY]$ ]]
 }
@@ -430,11 +431,14 @@ fs.inotify.max_user_instances = 1024
 fs.aio-max-nr = 1048576
 
 # --- IPv6 --------------------------------------------------------------------
+# Durcissement uniquement — pas de net.ipv6.conf.all.forwarding = 1 ici :
+# la seedbox ne route pas d'IPv6 (Docker travaille en IPv4), et l'activer
+# ferait ignorer les Router Advertisements par le noyau → une VM dont
+# l'IPv6 est auto-configurée (SLAAC) perdrait sa connectivité IPv6.
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_source_route = 0
 net.ipv6.conf.default.accept_source_route = 0
-net.ipv6.conf.all.forwarding = 1
 EOF
 
     if [[ "$profile" == "pve-host" ]]; then
@@ -678,7 +682,8 @@ do_apply() {
         "Analyse le matériel (CPU, RAM, carte réseau) et règle réseau + writeback NFS"
     opt_compute
     detect_interface
-    echo "  CPU : ${OPT_CPU_CORES} cœurs   RAM : ${OPT_RAM_GB} Go   Interface : ${WAN_IF} ${WAN_DRIVER:+($WAN_DRIVER)}"
+    echo "  Machine : $(env_label)   CPU : ${OPT_CPU_CORES} cœurs   RAM : ${OPT_RAM_GB} Go"
+    echo "  Interface : ${WAN_IF} ${WAN_DRIVER:+($WAN_DRIVER)}"
     echo "  Writeback NFS : flush dès $(fmt_bytes "$OPT_DIRTY_BG_BYTES"), plafond $(fmt_bytes "$OPT_DIRTY_BYTES")"
     echo ""
 
@@ -761,11 +766,18 @@ EOF
     msg_ok "Tuning carte réseau appliqué (offloads, UDP-GRO forwarding, files)."
 
     # irqbalance : désactivé quand le script fixe lui-même l'affinité des IRQ
-    # (il l'écraserait en continu) ; conservé sur un hôte Proxmox.
+    # (il l'écraserait en continu) ; conservé sur un hôte Proxmox. On mémorise
+    # si c'est NOUS qui l'avons coupé : --restore ne le réactivera que dans ce
+    # cas (un irqbalance volontairement désactivé avant nous le restera).
+    local irqb_disabled="no"
+    if [[ -r "$STATE_FILE" ]] && grep -q '^OPT_IRQBALANCE_DISABLED="yes"' "$STATE_FILE" 2>/dev/null; then
+        irqb_disabled="yes"   # coupé par une application précédente
+    fi
     if [[ "$profile" == "pve-host" ]]; then
         msg_info "Hôte Proxmox : irqbalance conservé (répartition multi-VM)."
     elif systemctl is-active --quiet irqbalance 2>/dev/null; then
         systemctl disable --now irqbalance >/dev/null 2>&1 || true
+        irqb_disabled="yes"
         msg_ok "irqbalance désactivé (il écraserait l'affinité IRQ fixée). Rétabli par --restore."
     fi
 
@@ -783,6 +795,7 @@ OPT_PROFILE="$profile"
 OPT_DATE="$(date '+%Y-%m-%d %H:%M')"
 OPT_CPU_CORES="$OPT_CPU_CORES"
 OPT_RAM_GB="$OPT_RAM_GB"
+OPT_IRQBALANCE_DISABLED="$irqb_disabled"
 EOF
 
     # Conseils que le script ne peut pas appliquer lui-même (côté hyperviseur)
@@ -825,9 +838,14 @@ do_restore() {
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload 2>/dev/null || true
 
-    if systemctl list-unit-files 2>/dev/null | grep -q '^irqbalance.service'; then
-        systemctl enable --now irqbalance >/dev/null 2>&1 || true
-        msg_ok "irqbalance réactivé."
+    # irqbalance : réactivé UNIQUEMENT si c'est l'optimiseur qui l'avait
+    # coupé (mémorisé dans l'état) — un service volontairement désactivé
+    # avant toute optimisation n'est pas touché.
+    if [[ -r "$STATE_FILE" ]] && grep -q '^OPT_IRQBALANCE_DISABLED="yes"' "$STATE_FILE" 2>/dev/null; then
+        if systemctl list-unit-files 2>/dev/null | grep -q '^irqbalance.service'; then
+            systemctl enable --now irqbalance >/dev/null 2>&1 || true
+            msg_ok "irqbalance réactivé."
+        fi
     fi
 
     # Valeurs par défaut de Debian pour les clés les plus impactantes.
@@ -869,8 +887,13 @@ do_status() {
     [[ -r "$STATE_FILE" ]] && source "$STATE_FILE"
 
     echo "  ${C_BOLD}Optimisation réseau & stockage :${C_NC}"
+    echo "    Machine     : $(env_label) — $(nproc) CPU, $(free -h | awk '/^Mem:/{print $2}') RAM"
     if [[ "$OPT_APPLIED" == "yes" && -f "$SYSCTL_FILE" ]]; then
         echo "    État        : ${C_GREEN}appliquée${C_NC} (profil $OPT_PROFILE, le $OPT_DATE)"
+    elif [[ -f "$SYSCTL_FILE" ]]; then
+        # Le fichier sysctl (lisible par tous) existe mais l'état détaillé
+        # (600, root) n'est pas lisible : exécution sans droits root.
+        echo "    État        : ${C_GREEN}appliquée${C_NC} ${C_DIM}(détails complets en root)${C_NC}"
     elif [[ -f "/etc/sysctl.d/99-labobox-ultimate.conf" || -f "/etc/sysctl.d/99-labobox-storage.conf" ]]; then
         echo "    État        : ${C_YELLOW}ancienne version détectée${C_NC} — relance l'application"
     else

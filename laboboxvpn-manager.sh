@@ -529,6 +529,31 @@ format_bytes() {
 }
 
 ###########################################
+# ROTATION AUTOMATIQUE DES LOGS (logrotate)
+###########################################
+# Remplace l'ancien menu « Rotation des logs » : logrotate est lancé chaque
+# jour par Debian (cron/systemd), plus rien à faire à la main. copytruncate
+# est obligatoire : rtorrent garde son fichier de log ouvert en permanence.
+# Couvre les logs sur disque local (volume /local) ET les anciens chemins
+# NFS des clients pas encore migrés.
+
+install_logrotate() {
+    cat > /etc/logrotate.d/laboboxvpn << EOF
+# LaboBox-VPN - rotation automatique des logs rtorrent (généré)
+${CLIENTS_DIR}/*/local/log/*.log ${NAS_MOUNT}/${NAS_SHARE_PREFIX}*/docker_apps/rtorrent/log/*.log {
+    size 10M
+    rotate 3
+    missingok
+    notifempty
+    copytruncate
+    compress
+    delaycompress
+    su root root
+}
+EOF
+}
+
+###########################################
 # FONCTIONS CLIENTS
 ###########################################
 
@@ -2101,6 +2126,7 @@ cmd_init() {
     mkdir -p "$CLIENTS_DIR"
     mkdir -p "$UTILS_DIR"
     mkdir -p "$INSTALL_DIR/apps"
+    install_logrotate
     echo -e "\r  ${DIM}[6/${total_steps}]${NC} Création des répertoires ${DIM}...${NC} ${GREEN}✔${NC}"
     
     # Monter les partages existants
@@ -2113,6 +2139,7 @@ cmd_init() {
     print_item "Docker" "$(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')"
     print_item "Docker Compose" "$(docker compose version 2>/dev/null | cut -d' ' -f4)"
     print_item "NFS Client" "$(dpkg -l nfs-common 2>/dev/null | grep -q '^ii' && echo 'Installé' || echo 'Non')"
+    print_item "Rotation logs" "Automatique (logrotate, quotidienne)"
     print_item_last "Répertoire" "$INSTALL_DIR"
     echo ""
     echo -e "  ${WHITE}Prochaine étape :${NC}"
@@ -2250,8 +2277,12 @@ cmd_migrate_sessions() {
     if [ "$count" -eq 0 ]; then
         echo -e "  ${DIM}Aucun client trouve${NC}"
     else
+        # Les logs partent aussi sur /local : la rotation automatique doit
+        # couvrir le nouveau chemin (idempotent, réécrit le drop-in complet).
+        install_logrotate
         echo -e "  ${DIM}$count client(s) traite(s). Une sauvegarde .bak a ete creee${NC}"
         echo -e "  ${DIM}pour chaque docker-compose.yml modifie.${NC}"
+        echo -e "  ${DIM}Rotation automatique des logs installee (logrotate).${NC}"
         echo ""
         echo -e "  ${WHITE}Etape suivante :${NC}"
         echo -e "  ${DIM}  cd $CLIENTS_DIR/<client> && docker compose down && docker compose up -d${NC}"
@@ -2874,6 +2905,7 @@ cmd_uninstall() {
         rm -rf "$CLIENTS_DIR/$client" 2>/dev/null || true
     done
     rm -rf "$INSTALL_DIR/apps" 2>/dev/null || true
+    rm -f /etc/logrotate.d/laboboxvpn 2>/dev/null || true
     echo -e "\r  ${DIM}[${step}/${total_steps}]${NC} Suppression de la configuration ${DIM}...${NC} ${GREEN}✔${NC}"
     
     print_success_box "DÉSINSTALLATION TERMINÉE"

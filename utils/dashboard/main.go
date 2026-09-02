@@ -889,7 +889,7 @@ func collectSystem() SystemStats {
 
 var allowedActions = map[string]bool{
 	"start": true, "stop": true, "restart": true, "remove": true,
-	"health": true, "quota": true, "sync-libs": true, "rotate-logs": true, "mount": true, "build": true,
+	"health": true, "quota": true, "sync-libs": true, "mount": true, "build": true,
 	"install-plex": true, "uninstall-plex": true,
 	"install-jellyfin": true, "uninstall-jellyfin": true,
 	"install-resilio": true, "uninstall-resilio": true,
@@ -900,7 +900,7 @@ var allowedActions = map[string]bool{
 
 var adminOnlyActions = map[string]bool{
 	"remove": true, "health": true, "quota": true, "sync-libs": true,
-	"rotate-logs": true, "mount": true, "build": true,
+	"mount": true, "build": true,
 	"install-plex": true, "uninstall-plex": true,
 	"install-jellyfin": true, "uninstall-jellyfin": true,
 	"install-resilio": true, "uninstall-resilio": true,
