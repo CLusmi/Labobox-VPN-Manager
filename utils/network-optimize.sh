@@ -1,853 +1,944 @@
 #!/bin/bash
-###############################################################################
-#                                                                             #
-#                    LABOBOX - OPTIMISATION RESEAU ULTIME                     #
-#                                                                             #
-#                              Version 3.0.0                                  #
-#                                                                             #
-#                    Detection automatique RAM/CPU                            #
-#                    Backup et restauration inclus                            #
-#                                                                             #
-#                           By CLusmi - 2025                                  #
-#                                                                             #
-###############################################################################
+#===============================================================================
 #
-# UTILISATION :
-# =============
-#   ./network-optimize.sh           # Appliquer les optimisations
-#   ./network-optimize.sh --restore # Restaurer les parametres d'origine
-#   ./network-optimize.sh --status  # Voir le statut actuel
-#   ./network-optimize.sh --help    # Aide
+#  LaboBox-VPN — Optimisation réseau & stockage NFS
 #
-###############################################################################
+#  Portage de l'optimiseur de Network-WireGuard-Manager, adapté à la seedbox :
+#    - paramètres kernel (sysctl) dimensionnés d'après le CPU et la RAM,
+#      profil adapté à l'environnement détecté (bare-metal / VM / hôte Proxmox),
+#    - BBR + fq (repli automatique sur cubic si le noyau ne propose pas BBR),
+#    - writeback disque en BYTES et non en ratio : le flush vers le NAS
+#      devient continu au lieu d'explosif (l'ex-menu « Optimisation
+#      stockage NFS » est intégré ici, il n'existe plus séparément),
+#    - conntrack dimensionné + hashsize aligné (NAT Docker/Gluetun),
+#    - tuning matériel de la carte réseau rejoué à chaque boot : files
+#      multiqueue, ring buffers, offloads (dont UDP-GRO forwarding, décisif
+#      pour le trafic WireGuard), affinité IRQ, RPS/XPS,
+#    - limites système raisonnées (pas de memlock illimité pour tous),
+#    - réversible d'un seul geste (--restore).
+#
+#  UTILISATION :
+#    ./network-optimize.sh            Appliquer l'optimisation (profil auto)
+#    ./network-optimize.sh --yes      Appliquer sans confirmation (scriptable)
+#    ./network-optimize.sh --status   Voir le statut actuel
+#    ./network-optimize.sh --restore  Restaurer les paramètres d'origine
+#    ./network-optimize.sh --help     Aide
+#
+#===============================================================================
 
-set -e
+# Pas de 'set -e' : un retour non nul anodin (grep sans résultat, clé sysctl
+# refusée par le noyau…) ne doit pas interrompre une application en cours.
+set -o pipefail
 
-# Couleurs
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-DIM='\033[2m'
-NC='\033[0m'
+# Locale C forcée : sur un système en locale française, awk/printf formatent
+# les décimaux avec une virgule et free/df traduisent leurs en-têtes. La
+# locale C garantit des parsings identiques partout ; les textes du script,
+# écrits en dur en français, ne sont pas concernés.
+export LC_ALL=C
 
-# Repertoire de backup
-BACKUP_DIR="/var/backups/labobox-network"
-SYSCTL_FILE="/etc/sysctl.d/99-labobox-ultimate.conf"
+VERSION="4.0.0"
+
+#--- Chemins -------------------------------------------------------------------
+INSTALL_DIR="/opt/laboboxvpn"
+UTILS_DIR="${INSTALL_DIR}/utils"
+SYSCTL_FILE="/etc/sysctl.d/99-labobox-network.conf"
 LIMITS_FILE="/etc/security/limits.d/99-labobox.conf"
+MODPROBE_FILE="/etc/modprobe.d/99-labobox.conf"
+MODULES_FILE="/etc/modules-load.d/labobox.conf"
+NIC_TUNE_FILE="${UTILS_DIR}/labobox-nic-tune.sh"
+SERVICE_FILE="/etc/systemd/system/labobox-optimize.service"
+STATE_FILE="${UTILS_DIR}/network-optimize.state"
+BACKUP_DIR="/var/backups/labobox-network"
 
-###############################################################################
-# FONCTIONS AFFICHAGE
-###############################################################################
+# Fichiers laissés par les versions précédentes du script : retirés à
+# l'application comme à la restauration. En particulier, les deux anciens
+# fichiers sysctl se contredisaient (99-labobox-ultimate.conf, appliqué
+# après 99-labobox-storage.conf, remettait vm.dirty_ratio et annulait donc
+# le writeback en bytes) : tout vit désormais dans UN SEUL fichier.
+LEGACY_FILES=(
+    "/etc/sysctl.d/99-labobox-ultimate.conf"
+    "/etc/sysctl.d/99-labobox-storage.conf"
+    "/etc/modules-load.d/bbr.conf"
+    "${UTILS_DIR}/labobox-irq-affinity.sh"
+)
 
-line() {
-    echo "------------------------------------------------------------------------"
-}
+#--- Affichage (marge commune de deux espaces, comme Network-WireGuard-Manager)
+if [[ -t 1 ]]; then
+    C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[1;33m'
+    C_BLUE=$'\033[0;34m'; C_CYAN=$'\033[0;36m'; C_WHITE=$'\033[1;37m'
+    C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'; C_NC=$'\033[0m'
+else
+    C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""
+    C_WHITE=""; C_DIM=""; C_BOLD=""; C_NC=""
+fi
 
-double_line() {
-    echo "========================================================================"
-}
+MARGIN="  "
+
+msg_ok()   { echo "${MARGIN}${C_GREEN}✔${C_NC} $*"; }
+msg_err()  { echo "${MARGIN}${C_RED}✗${C_NC} $*"; }
+msg_warn() { echo "${MARGIN}${C_YELLOW}⚠${C_NC} $*"; }
+msg_info() { echo "${MARGIN}${C_CYAN}ℹ${C_NC} $*"; }
 
 print_header() {
-    clear
     echo ""
-    double_line
-    echo "  LABOBOX - OPTIMISATION RESEAU ULTIME                      v3.0.0"
-    double_line
-    echo ""
-}
-
-print_step() {
-    echo ""
-    echo -e "  ${CYAN}>>>${NC} $1"
-}
-
-print_substep() {
-    echo -e "      ${DIM}-${NC} $1"
-}
-
-print_success() {
-    echo -e "      ${GREEN}[OK]${NC} $1"
-}
-
-print_error() {
-    echo -e "      ${RED}[ERREUR]${NC} $1"
-}
-
-print_warning() {
-    echo -e "      ${YELLOW}[!]${NC} $1"
-}
-
-print_info() {
-    echo -e "  ${DIM}$1${NC}"
-}
-
-print_value() {
-    local label=$1
-    local value=$2
-    printf "      %-18s : %s\n" "$label" "$value"
-}
-
-print_analyzing() {
-    echo -ne "      ${DIM}Analyse en cours...${NC}"
-    sleep 0.5
-    echo -ne "\r      ${DIM}Analyse en cours....${NC}"
-    sleep 0.5
-    echo -ne "\r      ${DIM}Analyse en cours.....${NC}"
-    sleep 0.5
-    echo -e "\r                                     \r"
-}
-
-print_applying() {
-    echo -ne "      ${DIM}Application en cours...${NC}"
-    sleep 0.3
-    echo -ne "\r      ${DIM}Application en cours....${NC}"
-    sleep 0.3
-    echo -ne "\r      ${DIM}Application en cours.....${NC}"
-    sleep 0.3
-    echo -e "\r                                        \r"
-}
-
-###############################################################################
-# SHOW HELP
-###############################################################################
-
-show_help() {
-    print_header
-    echo "  AIDE"
-    line
-    echo ""
-    echo "  Usage: network-optimize.sh [OPTION]"
-    echo ""
-    echo "  Options:"
-    echo "    (aucune)     Appliquer les optimisations reseau"
-    echo "    --restore    Restaurer les parametres d'origine"
-    echo "    --status     Afficher le statut actuel"
-    echo "    --help       Afficher cette aide"
-    echo ""
-    echo "  Exemples:"
-    echo "    network-optimize.sh              # Optimiser le reseau"
-    echo "    network-optimize.sh --restore    # Revenir aux parametres par defaut"
-    echo "    network-optimize.sh --status     # Voir la configuration actuelle"
-    echo ""
-    double_line
+    echo "${MARGIN}${C_CYAN}══════════════════════════════════════════════════════════════════════${C_NC}"
+    # Titre en ASCII : printf %-58s compte les octets, pas les caractères —
+    # un accent décalerait l'alignement de la version à droite.
+    printf "${MARGIN}${C_BOLD}${C_WHITE}%-58s${C_NC}${C_CYAN}%10s${C_NC}\n" "LABOBOX - OPTIMISATION RESEAU & STOCKAGE" "v${VERSION}"
+    echo "${MARGIN}${C_CYAN}══════════════════════════════════════════════════════════════════════${C_NC}"
     echo ""
 }
 
-###############################################################################
-# SHOW STATUS
-###############################################################################
+# print_section "Titre" ["explication courte affichée en dessous"]
+print_section() {
+    echo ""
+    echo "${MARGIN}${C_BLUE}══════════════════════════════════════════════════════════════════════${C_NC}"
+    echo "${MARGIN}${C_BOLD}${C_WHITE}$1${C_NC}"
+    [[ -n "${2:-}" ]] && echo "${MARGIN}${C_DIM}$2${C_NC}"
+    echo "${MARGIN}${C_BLUE}══════════════════════════════════════════════════════════════════════${C_NC}"
+    echo ""
+}
 
-show_status() {
-    print_header
-    echo "  STATUT ACTUEL"
-    line
-    
-    # Systeme
-    print_step "SYSTEME"
-    print_value "RAM totale" "$(free -h | awk '/^Mem:/{print $2}')"
-    print_value "RAM disponible" "$(free -h | awk '/^Mem:/{print $7}')"
-    print_value "CPU cores" "$(nproc)"
-    
-    # TCP
-    print_step "TCP CONGESTION"
-    print_value "Algorithme" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'N/A')"
-    print_value "Disponibles" "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo 'N/A')"
-    
-    # Buffers
-    print_step "BUFFERS RESEAU"
-    print_value "rmem_max" "$(numfmt --to=iec $(sysctl -n net.core.rmem_max 2>/dev/null) 2>/dev/null || echo 'N/A')"
-    print_value "wmem_max" "$(numfmt --to=iec $(sysctl -n net.core.wmem_max 2>/dev/null) 2>/dev/null || echo 'N/A')"
-    
-    # TCP Options
-    print_step "OPTIONS TCP"
-    print_value "Fast Open" "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 'N/A')"
-    print_value "Slow Start" "$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo 'N/A')"
-    print_value "MTU Probing" "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo 'N/A')"
-    
-    # Backup
-    print_step "BACKUP"
-    if [ -d "$BACKUP_DIR" ]; then
-        print_value "Status" "Disponible"
-        print_value "Emplacement" "$BACKUP_DIR"
-    else
-        print_value "Status" "Aucun backup"
+print_kv() {
+    printf "    %-16s ${C_GREEN}%s${C_NC}\n" "$1" "$2"
+}
+
+# Question oui/non avec valeur par défaut. ask_yn "Question ?" "o" → 0 si oui.
+ask_yn() {
+    local prompt="$1" default="${2:-n}" reply
+    local hint="o/N"; [[ "$default" == "o" ]] && hint="O/n"
+    printf '%s%s (%s) : ' "$MARGIN" "$prompt" "$hint"
+    read -r reply || true
+    reply="${reply:-$default}"
+    [[ "$reply" =~ ^[oOyY]$ ]]
+}
+
+fmt_bytes() {
+    # Octets → unité lisible (o / Ko / Mo / Go / To)
+    awk -v b="${1:-0}" 'BEGIN{
+        split("o Ko Mo Go To", u, " "); i=1
+        while (b>=1024 && i<5){ b=b/1024; i++ }
+        printf "%.2f %s", b, u[i]
+    }'
+}
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        msg_err "Ce script doit être exécuté en root."
+        exit 1
     fi
-    
-    # Optimisation active ?
-    print_step "OPTIMISATION LABOBOX"
-    if [ -f "$SYSCTL_FILE" ]; then
-        echo -e "      ${GREEN}ACTIVE${NC}"
-    else
-        echo -e "      ${YELLOW}NON ACTIVE${NC}"
+}
+
+# Écriture atomique : le fichier n'est jamais visible à moitié écrit.
+# write_file <chemin> <mode> ← contenu sur stdin
+write_file() {
+    local path="$1" mode="${2:-644}"
+    mkdir -p "$(dirname "$path")"
+    if cat > "${path}.tmp" && chmod "$mode" "${path}.tmp" && mv "${path}.tmp" "$path"; then
+        return 0
     fi
-    
-    echo ""
-    double_line
-    echo ""
+    rm -f "${path}.tmp"
+    msg_err "Échec d'écriture de $path"
+    return 1
 }
 
-###############################################################################
-# BACKUP
-###############################################################################
-
-do_backup() {
-    print_step "CREATION DU BACKUP DE SECURITE"
-    
-    print_substep "Creation du repertoire de backup..."
-    sleep 0.5
-    mkdir -p "$BACKUP_DIR"
-    
-    print_substep "Sauvegarde des parametres sysctl actuels..."
-    sleep 0.5
-    sysctl -a > "$BACKUP_DIR/sysctl-original.conf" 2>/dev/null || true
-    
-    print_substep "Sauvegarde des fichiers de configuration..."
-    sleep 0.5
-    [ -f /etc/sysctl.conf ] && cp /etc/sysctl.conf "$BACKUP_DIR/"
-    [ -d /etc/sysctl.d ] && cp -r /etc/sysctl.d "$BACKUP_DIR/"
-    [ -d /etc/security/limits.d ] && cp -r /etc/security/limits.d "$BACKUP_DIR/"
-    
-    print_substep "Sauvegarde des modules charges..."
-    sleep 0.5
-    lsmod > "$BACKUP_DIR/modules.txt"
-    
-    # Script de restauration
-    cat > "$BACKUP_DIR/restore-values.sh" << 'RESTORE_EOF'
-#!/bin/bash
-sysctl -w net.core.default_qdisc=fq_codel
-sysctl -w net.ipv4.tcp_congestion_control=cubic
-sysctl -w net.core.rmem_max=212992
-sysctl -w net.core.wmem_max=212992
-sysctl -w net.core.rmem_default=212992
-sysctl -w net.core.wmem_default=212992
-sysctl -w net.ipv4.tcp_rmem="4096 131072 6291456"
-sysctl -w net.ipv4.tcp_wmem="4096 16384 4194304"
-sysctl -w net.ipv4.tcp_fastopen=1
-sysctl -w net.ipv4.tcp_slow_start_after_idle=1
-sysctl -w net.ipv4.tcp_mtu_probing=0
-sysctl -w net.core.somaxconn=4096
-sysctl -w net.core.netdev_max_backlog=1000
-sysctl -w vm.swappiness=60
-sysctl -w vm.dirty_ratio=20
-sysctl -w vm.dirty_background_ratio=10
-RESTORE_EOF
-    chmod +x "$BACKUP_DIR/restore-values.sh"
-    
-    print_success "Backup cree : $BACKUP_DIR"
+# Installe des paquets apt s'ils sont absents, en une seule passe apt-get.
+apt_ensure() {
+    local missing=() pkg
+    for pkg in "$@"; do
+        dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+    done
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+    msg_info "Installation des paquets : ${missing[*]}"
+    apt-get update -qq >/dev/null 2>&1 || true
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" >/dev/null 2>&1; then
+        msg_ok "Paquets installés : ${missing[*]}"
+        return 0
+    fi
+    msg_warn "Échec d'installation : ${missing[*]} — on continue sans."
+    return 1
 }
 
-###############################################################################
-# RESTORE
-###############################################################################
+#--- Détection de l'environnement ----------------------------------------------
+# baremetal | vm | pve-host. Un hôte Proxmox se reconnaît à /etc/pve ET à
+# pveversion. La seedbox est prévue pour tourner dans une VM, mais chaque
+# profil applique le tuning adapté à sa situation.
+OPT_ENV=""
+OPT_VIRT=""
 
-do_restore() {
-    print_header
-    echo "  RESTAURATION DES PARAMETRES D'ORIGINE"
-    line
-    
-    if [ ! -d "$BACKUP_DIR" ]; then
-        print_warning "Aucun backup trouve dans $BACKUP_DIR"
-        echo ""
-        echo -n "  Restaurer les valeurs par defaut Debian ? (o/n) : "
-        read -r REPLY
-        if [[ ! $REPLY =~ ^[Oo]$ ]]; then
-            echo ""
-            print_info "Restauration annulee."
-            echo ""
-            return
+detect_env() {
+    [[ -n "$OPT_ENV" ]] && return 0
+    OPT_VIRT=$(systemd-detect-virt 2>/dev/null)
+    [[ -z "$OPT_VIRT" ]] && OPT_VIRT="none"
+    if [[ -d /etc/pve ]] && command -v pveversion >/dev/null 2>&1; then
+        OPT_ENV="pve-host"
+    elif [[ "$OPT_VIRT" != "none" ]]; then
+        OPT_ENV="vm"
+    else
+        OPT_ENV="baremetal"
+    fi
+    return 0
+}
+
+env_label() {
+    detect_env
+    case "$OPT_ENV" in
+        pve-host)  echo "hôte Proxmox" ;;
+        vm)        echo "VM ($OPT_VIRT)" ;;
+        baremetal) echo "bare-metal" ;;
+    esac
+}
+
+# Interface de sortie vers Internet : interface de la route par défaut, sinon
+# première carte active plausible. Sont exclues : lo, wg*, docker*, br-*,
+# veth*, ifb*, tun/tap, vir*. Les bridges vmbr* ne sont PAS exclus (hôte PVE).
+WAN_IF=""
+WAN_DRIVER=""
+
+detect_interface() {
+    if [[ -z "$WAN_IF" ]]; then
+        WAN_IF=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+        if [[ -z "$WAN_IF" ]]; then
+            WAN_IF=$(ip -o link show up 2>/dev/null \
+                | awk -F': ' '$2 !~ /^(lo|wg|docker|br-|veth|ifb|tun|tap|vir)/{print $2; exit}')
         fi
     fi
-    
-    print_step "SUPPRESSION DES CONFIGURATIONS LABOBOX"
-    
-    print_substep "Suppression des fichiers sysctl..."
-    sleep 0.5
-    rm -f "$SYSCTL_FILE"
-    rm -f "$LIMITS_FILE"
-    rm -f /etc/modules-load.d/bbr.conf
-    rm -f /opt/laboboxvpn/utils/labobox-irq-affinity.sh
-    
-    print_substep "Desactivation du service systemd..."
-    sleep 0.5
-    systemctl disable labobox-optimize.service 2>/dev/null || true
-    systemctl stop labobox-optimize.service 2>/dev/null || true
-    rm -f /etc/systemd/system/labobox-optimize.service
-    systemctl daemon-reload
-    
-    print_step "RESTAURATION DES VALEURS PAR DEFAUT"
-    print_analyzing
-    
-    if [ -f "$BACKUP_DIR/restore-values.sh" ]; then
-        bash "$BACKUP_DIR/restore-values.sh" 2>/dev/null || true
-    else
-        sysctl -w net.core.default_qdisc=fq_codel 2>/dev/null || true
-        sysctl -w net.ipv4.tcp_congestion_control=cubic 2>/dev/null || true
-        sysctl -w net.core.rmem_max=212992 2>/dev/null || true
-        sysctl -w net.core.wmem_max=212992 2>/dev/null || true
-    fi
-    
-    print_success "Parametres par defaut restaures"
-    
-    echo ""
-    double_line
-    echo "  RESTAURATION TERMINEE"
-    double_line
-    echo ""
-    print_info "Un reboot est recommande : reboot"
-    echo ""
+    [[ -z "$WAN_IF" ]] && WAN_IF="eth0"
+    WAN_DRIVER=$(basename "$(readlink -f "/sys/class/net/$WAN_IF/device/driver" 2>/dev/null)" 2>/dev/null || true)
+    [[ "$WAN_DRIVER" == "." ]] && WAN_DRIVER=""
+    return 0
 }
 
-###############################################################################
-# DETECTION ET CALCUL
-###############################################################################
+#--- Calculs dimensionnés sur les ressources -----------------------------------
+opt_compute() {
+    OPT_CPU_CORES=$(nproc)
+    OPT_RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+    OPT_RAM_GB=${OPT_RAM_GB:-1}
+    (( OPT_RAM_GB < 1 )) && OPT_RAM_GB=1
 
-detect_and_calculate() {
-    # =========================================================================
-    # DETECTION CPU
-    # =========================================================================
-    print_step "ANALYSE DU PROCESSEUR"
-    
-    print_substep "Detection du nombre de coeurs CPU..."
-    print_analyzing
-    
-    CPU_CORES=$(nproc)
-    print_success "Processeur detecte : ${CPU_CORES} coeurs"
-    
-    print_substep "Calcul des optimisations pour ${CPU_CORES} coeurs..."
-    sleep 0.8
-    
-    # Somaxconn & backlog bases sur CPU
-    SOMAXCONN=$((CPU_CORES * 4096))
-    [ $SOMAXCONN -gt 65535 ] && SOMAXCONN=65535
-    NETDEV_BACKLOG=$((CPU_CORES * 16384))
-    [ $NETDEV_BACKLOG -gt 250000 ] && NETDEV_BACKLOG=250000
-    
-    print_success "somaxconn optimise : ${SOMAXCONN}"
-    print_success "netdev_backlog optimise : ${NETDEV_BACKLOG}"
-    
-    # =========================================================================
-    # DETECTION RAM
-    # =========================================================================
-    print_step "ANALYSE DE LA MEMOIRE RAM"
-    
-    print_substep "Detection de la quantite de RAM..."
-    print_analyzing
-    
-    RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
-    RAM_BYTES=$(free -b | awk '/^Mem:/{print $2}')
-    print_success "Memoire detectee : ${RAM_GB} Go"
-    
-    print_substep "Calcul des optimisations pour ${RAM_GB} Go de RAM..."
-    sleep 0.8
-    
-    # Buffers reseau (128 Mo pour 10 Gbps)
-    RMEM_MAX=134217728
-    WMEM_MAX=134217728
-    RMEM_DEFAULT=8388608
-    WMEM_DEFAULT=8388608
-    
-    # TCP Memory base sur RAM
-    TCP_MEM_LOW=$((RAM_GB * 16384))
-    TCP_MEM_PRESSURE=$((RAM_GB * 32768))
-    TCP_MEM_HIGH=$((RAM_GB * 131072))
-    [ $TCP_MEM_LOW -lt 65536 ] && TCP_MEM_LOW=65536
-    [ $TCP_MEM_PRESSURE -lt 131072 ] && TCP_MEM_PRESSURE=131072
-    [ $TCP_MEM_HIGH -lt 262144 ] && TCP_MEM_HIGH=262144
-    
-    # Min free kbytes
-    MIN_FREE_KBYTES=$((RAM_GB * 2048))
-    [ $MIN_FREE_KBYTES -lt 65536 ] && MIN_FREE_KBYTES=65536
-    [ $MIN_FREE_KBYTES -gt 262144 ] && MIN_FREE_KBYTES=262144
-    
-    # Conntrack
-    CONNTRACK_MAX=$((RAM_GB * 65536))
-    [ $CONNTRACK_MAX -lt 131072 ] && CONNTRACK_MAX=131072
-    
-    # File descriptors
-    FILE_MAX=$((RAM_GB * 65536))
-    [ $FILE_MAX -lt 262144 ] && FILE_MAX=262144
-    
-    # Inotify
-    INOTIFY_WATCHES=$((RAM_GB * 32768))
-    [ $INOTIFY_WATCHES -gt 1048576 ] && INOTIFY_WATCHES=1048576
-    
-    print_success "tcp_mem optimise : ${TCP_MEM_LOW} / ${TCP_MEM_PRESSURE} / ${TCP_MEM_HIGH}"
-    print_success "conntrack_max optimise : ${CONNTRACK_MAX}"
-    print_success "file_max optimise : ${FILE_MAX}"
-    
-    # =========================================================================
-    # DETECTION INTERFACE RESEAU
-    # =========================================================================
-    print_step "ANALYSE DE L'INTERFACE RESEAU"
-    
-    print_substep "Detection de l'interface principale..."
-    print_analyzing
-    
-    MAIN_NIC=$(ip route | grep default | awk '{print $5}' | head -1)
-    [ -z "$MAIN_NIC" ] && MAIN_NIC="eth0"
-    print_success "Interface detectee : ${MAIN_NIC}"
-    
-    # =========================================================================
-    # RESUME
-    # =========================================================================
-    print_step "RESUME DE L'ANALYSE"
-    line
-    print_value "CPU" "${CPU_CORES} coeurs"
-    print_value "RAM" "${RAM_GB} Go"
-    print_value "Interface" "${MAIN_NIC}"
-    print_value "Buffers reseau" "128 Mo (optimise 10 Gbps)"
-    echo ""
-    sleep 1
+    # Files d'attente : proportionnelles au CPU, plafonnées (des valeurs
+    # extrêmes immobilisent de la mémoire par cœur sans gain sous 10 Gb/s).
+    OPT_SOMAXCONN=$((OPT_CPU_CORES * 4096))
+    (( OPT_SOMAXCONN > 65535 )) && OPT_SOMAXCONN=65535
+    OPT_NETDEV_BACKLOG=$((OPT_CPU_CORES * 2048))
+    (( OPT_NETDEV_BACKLOG > 65536 )) && OPT_NETDEV_BACKLOG=65536
+
+    # Buffers réseau : plafond d'auto-tuning à 128 Mo, valeur initiale 4 Mo.
+    # rmem/wmem_default s'appliquent aussi aux sockets UDP, donc au tunnel
+    # WireGuard de Gluetun : 4 Mo suffisent à éviter les pertes UDP en
+    # multi-gigabit sans gaspiller. Ces plafonds garantissent aussi que les
+    # network.receive_buffer / send_buffer de rtorrent ne sont pas plafonnés
+    # silencieusement par le noyau.
+    OPT_RMEM_MAX=134217728
+    OPT_WMEM_MAX=134217728
+    OPT_RMEM_DEFAULT=4194304
+    OPT_WMEM_DEFAULT=4194304
+    OPT_TCP_RMEM_DEFAULT=1048576
+    OPT_TCP_WMEM_DEFAULT=1048576
+    OPT_OPTMEM_MAX=65536
+
+    # Réserve mémoire du kernel : 2 Mo par Go de RAM, bornée [64 Mo, 256 Mo]
+    OPT_MIN_FREE_KBYTES=$((OPT_RAM_GB * 2048))
+    (( OPT_MIN_FREE_KBYTES < 65536 ))  && OPT_MIN_FREE_KBYTES=65536
+    (( OPT_MIN_FREE_KBYTES > 262144 )) && OPT_MIN_FREE_KBYTES=262144
+
+    # Table conntrack : chaque connexion de peer qui traverse le NAT Docker
+    # y consomme une entrée. Plafonnée à 1M (~350 Mo de RAM). Le hashsize
+    # doit suivre (max/4), sinon les buckets débordent et le temps de
+    # recherche s'effondre.
+    OPT_CONNTRACK_MAX=$((OPT_RAM_GB * 16384))
+    (( OPT_CONNTRACK_MAX < 131072 ))  && OPT_CONNTRACK_MAX=131072
+    (( OPT_CONNTRACK_MAX > 1048576 )) && OPT_CONNTRACK_MAX=1048576
+    OPT_CONNTRACK_BUCKETS=$((OPT_CONNTRACK_MAX / 4))
+
+    OPT_FILE_MAX=$((OPT_RAM_GB * 65536))
+    (( OPT_FILE_MAX < 262144 )) && OPT_FILE_MAX=262144
+
+    OPT_INOTIFY_WATCHES=$((OPT_RAM_GB * 32768))
+    (( OPT_INOTIFY_WATCHES > 1048576 )) && OPT_INOTIFY_WATCHES=1048576
+    (( OPT_INOTIFY_WATCHES < 65536 ))   && OPT_INOTIFY_WATCHES=65536
+
+    # Writeback en BYTES (ex-« Optimisation stockage NFS », intégrée ici).
+    # Par défaut le noyau raisonne en ratio de la RAM (dirty_ratio = 20) :
+    # avec beaucoup de RAM, des gigaoctets de pages sales s'accumulent puis
+    # partent d'un coup vers le NAS — un array mécanique encaisse la rafale
+    # pendant des dizaines de secondes et rtorrent gèle. En bytes, le flush
+    # démarre tôt et reste continu. Dimensionné sur la RAM et borné :
+    #   - seuil de flush en tâche de fond : 32 Mo/Go, borné [64 Mo, 256 Mo]
+    #   - plafond bloquant : 4× le seuil, borné [256 Mo, 1 Go]
+    OPT_DIRTY_BG_BYTES=$((OPT_RAM_GB * 33554432))
+    (( OPT_DIRTY_BG_BYTES < 67108864 ))  && OPT_DIRTY_BG_BYTES=67108864
+    (( OPT_DIRTY_BG_BYTES > 268435456 )) && OPT_DIRTY_BG_BYTES=268435456
+    OPT_DIRTY_BYTES=$((OPT_DIRTY_BG_BYTES * 4))
+    (( OPT_DIRTY_BYTES > 1073741824 )) && OPT_DIRTY_BYTES=1073741824
+    return 0
 }
 
-###############################################################################
-# APPLICATION
-###############################################################################
-
-apply_optimizations() {
-    # =========================================================================
-    # OUTILS
-    # =========================================================================
-    print_step "VERIFICATION DES OUTILS"
-    
-    print_substep "Installation de ethtool si necessaire..."
-    apt-get update -qq >/dev/null 2>&1
-    apt-get install -y -qq ethtool >/dev/null 2>&1 || true
-    print_success "Outils verifies"
-    
-    # =========================================================================
-    # BBR
-    # =========================================================================
-    print_step "ACTIVATION DE L'ALGORITHME BBR (Google)"
-    
-    print_substep "BBR optimise le debit sur les connexions longue distance..."
-    sleep 0.5
-    print_substep "Gain moyen : +20% a +50% de debit"
-    sleep 0.5
-    
-    print_substep "Chargement du module tcp_bbr..."
+# BBR disponible sur ce noyau ? Charge le module et vérifie.
+# Affiche « bbr », ou « cubic » en repli.
+opt_cc_algo() {
     modprobe tcp_bbr 2>/dev/null || true
-    if ! grep -q "tcp_bbr" /etc/modules-load.d/*.conf 2>/dev/null; then
-        echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
+    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        echo "bbr"
+    else
+        echo "cubic"
     fi
-    print_success "Module BBR active"
-    
-    # =========================================================================
-    # SYSCTL
-    # =========================================================================
-    print_step "GENERATION DE LA CONFIGURATION KERNEL"
-    
-    print_substep "Creation du fichier de configuration optimise..."
-    print_substep "Adaptation pour ${RAM_GB} Go RAM et ${CPU_CORES} CPU..."
-    sleep 0.8
-    
-    cat > "$SYSCTL_FILE" << EOF
+}
+
+#--- Rendu sysctl (fonction pure : calculs faits, profil et algo en argument) --
+opt_render_sysctl() {
+    local profile="$1" cc_algo="$2"
+    cat << EOF
 ###############################################################################
-# LABOBOX - OPTIMISATION KERNEL v3.0.0
-# Genere le $(date '+%Y-%m-%d %H:%M')
-# Configuration : ${RAM_GB} Go RAM / ${CPU_CORES} coeurs CPU
+# LaboBox-VPN v${VERSION} — optimisation kernel GÉNÉRÉE, ne pas éditer.
+# Profil : ${profile} — ${OPT_RAM_GB} Go RAM / ${OPT_CPU_CORES} CPU
+# Regénéré par : network-optimize.sh
 ###############################################################################
 
-# BBR - Algorithme de congestion TCP (Google)
+# --- Congestion TCP : ${cc_algo} + fq (pacing kernel, requis par BBR) --------
 net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_congestion_control = ${cc_algo}
 
-# Buffers reseau (optimise pour 10 Gbps)
-net.core.rmem_max = ${RMEM_MAX}
-net.core.wmem_max = ${WMEM_MAX}
-net.core.rmem_default = ${RMEM_DEFAULT}
-net.core.wmem_default = ${WMEM_DEFAULT}
-net.core.optmem_max = ${RMEM_MAX}
+# --- Routage (NAT Docker/Gluetun) --------------------------------------------
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.forwarding = 1
 
-# Buffers TCP
-net.ipv4.tcp_rmem = 4096 ${RMEM_DEFAULT} ${RMEM_MAX}
-net.ipv4.tcp_wmem = 4096 ${WMEM_DEFAULT} ${WMEM_MAX}
+# --- Buffers sockets ---------------------------------------------------------
+# max = plafond d'auto-tuning ; default = valeur initiale (UDP inclus, donc
+# le tunnel WireGuard de Gluetun). Ne pas mettre default = max : chaque
+# socket réserverait 128 Mo.
+net.core.rmem_max = ${OPT_RMEM_MAX}
+net.core.wmem_max = ${OPT_WMEM_MAX}
+net.core.rmem_default = ${OPT_RMEM_DEFAULT}
+net.core.wmem_default = ${OPT_WMEM_DEFAULT}
+net.core.optmem_max = ${OPT_OPTMEM_MAX}
 
-# Buffers UDP
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
-
-# Memoire TCP globale
-net.ipv4.tcp_mem = ${TCP_MEM_LOW} ${TCP_MEM_PRESSURE} ${TCP_MEM_HIGH}
-
-# TCP Fast Open (economise 1 RTT par connexion)
-net.ipv4.tcp_fastopen = 3
-
-# Ne pas ralentir apres idle (important pour streaming)
-net.ipv4.tcp_slow_start_after_idle = 0
-
-# MTU Probing automatique
-net.ipv4.tcp_mtu_probing = 2
-net.ipv4.tcp_base_mss = 512
-
-# Window Scaling et Timestamps
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_timestamps = 1
-
-# SACK - Retransmission selective
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fack = 1
-net.ipv4.tcp_dsack = 1
-
-# Pas de cache des metriques
-net.ipv4.tcp_no_metrics_save = 1
-
-# Auto-tuning des buffers
+# --- Buffers TCP (min / default / max) ---------------------------------------
+net.ipv4.tcp_rmem = 4096 ${OPT_TCP_RMEM_DEFAULT} ${OPT_RMEM_MAX}
+net.ipv4.tcp_wmem = 4096 ${OPT_TCP_WMEM_DEFAULT} ${OPT_WMEM_MAX}
 net.ipv4.tcp_moderate_rcvbuf = 1
 
-# ECN et Low latency
-net.ipv4.tcp_ecn = 1
-net.ipv4.tcp_low_latency = 1
+# --- Buffers UDP (WireGuard) -------------------------------------------------
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
 
-# Thin streams optimizations
-net.ipv4.tcp_thin_linear_timeouts = 1
-net.ipv4.tcp_thin_dupack = 1
+# NOTE : net.ipv4.tcp_mem volontairement NON défini — le kernel le calcule
+# d'après la RAM au boot ; le forcer expose à l'épuisement mémoire sous flood.
 
-# Early retransmit
+# --- Options TCP -------------------------------------------------------------
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_early_retrans = 4
-
-# Tolerance au reordonnancement
 net.ipv4.tcp_reordering = 6
 
-# Listen backlog (optimise pour ${CPU_CORES} CPU)
-net.core.somaxconn = ${SOMAXCONN}
-net.ipv4.tcp_max_syn_backlog = ${SOMAXCONN}
+# MTU probing mode 1 : ne s'active QUE si un trou noir PMTU est détecté
+# (fréquent derrière un tunnel WireGuard, MTU 1420).
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_base_mss = 1024
 
-# Network backlog
-net.core.netdev_max_backlog = ${NETDEV_BACKLOG}
-net.core.netdev_budget = 50000
-net.core.netdev_budget_usecs = 5000
+# ECN mode 2 : accepté si le pair le demande, jamais demandé
+# (le mode 1 pose problème avec certains middleboxes).
+net.ipv4.tcp_ecn = 2
 
-# Connection tracking (optimise pour ${RAM_GB} Go RAM)
-net.netfilter.nf_conntrack_max = ${CONNTRACK_MAX}
+# --- Backlog et files --------------------------------------------------------
+net.core.somaxconn = ${OPT_SOMAXCONN}
+net.ipv4.tcp_max_syn_backlog = ${OPT_SOMAXCONN}
+net.core.netdev_max_backlog = ${OPT_NETDEV_BACKLOG}
+# 300 (défaut kernel) est court en multi-gigabit ; des valeurs très élevées
+# provoquent des stalls RCU — 1000 est le bon compromis.
+net.core.netdev_budget = 1000
+# netdev_budget_usecs : volontairement non défini (plancher dépendant de
+# CONFIG_HZ, la valeur par défaut est déjà au plancher).
 
-# TCP orphans et TIME_WAIT
+# --- Connection tracking (NAT Docker : chaque peer = une entrée) -------------
+net.netfilter.nf_conntrack_max = ${OPT_CONNTRACK_MAX}
+# Le timeout par défaut d'une session TCP établie est de 5 jours : la table
+# d'une passerelle NAT se remplirait de connexions de peers mortes. 24 h.
+net.netfilter.nf_conntrack_tcp_timeout_established = 86400
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 60
+net.netfilter.nf_conntrack_udp_timeout = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 180
+
+# --- TIME_WAIT et orphelins --------------------------------------------------
 net.ipv4.tcp_max_orphans = 262144
-net.ipv4.tcp_max_tw_buckets = 2097152
+net.ipv4.tcp_max_tw_buckets = 1048576
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_fin_timeout = 15
 
-# Keepalive (detection connexions mortes en 10 min)
+# --- Keepalive ---------------------------------------------------------------
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 60
 net.ipv4.tcp_keepalive_probes = 5
 
-# Memoire virtuelle (optimise pour ${RAM_GB} Go RAM)
-vm.swappiness = 10
-vm.dirty_ratio = 40
-vm.dirty_background_ratio = 10
-vm.dirty_expire_centisecs = 6000
-vm.dirty_writeback_centisecs = 1000
-vm.vfs_cache_pressure = 50
-vm.min_free_kbytes = ${MIN_FREE_KBYTES}
-vm.overcommit_memory = 0
+# --- Plage de ports source ---------------------------------------------------
+net.ipv4.ip_local_port_range = 10240 65000
 
-# Securite reseau
+# --- Mémoire virtuelle & writeback NFS ---------------------------------------
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+vm.min_free_kbytes = ${OPT_MIN_FREE_KBYTES}
+vm.max_map_count = 262144
+
+# Writeback en BYTES et non en ratio (ces clés remplacent vm.dirty_ratio /
+# vm.dirty_background_ratio, mises à zéro automatiquement par le noyau) :
+# le flush vers le NAS démarre à $(fmt_bytes "$OPT_DIRTY_BG_BYTES") en tâche de fond et ne peut
+# jamais accumuler plus de $(fmt_bytes "$OPT_DIRTY_BYTES") — continu au lieu d'explosif, les
+# disques mécaniques du NAS ne prennent plus de rafale et rtorrent ne gèle
+# plus pendant les gros flushs.
+vm.dirty_background_bytes = ${OPT_DIRTY_BG_BYTES}
+vm.dirty_bytes = ${OPT_DIRTY_BYTES}
+# Pages sales écrites au plus tard après 10 s, flusher réveillé chaque
+# seconde (défauts : 30 s / 5 s) : la file d'écriture reste courte.
+vm.dirty_expire_centisecs = 1000
+vm.dirty_writeback_centisecs = 100
+
+# --- Sécurité réseau ---------------------------------------------------------
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_synack_retries = 2
-net.ipv4.tcp_syn_retries = 2
+net.ipv4.tcp_syn_retries = 3
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 net.ipv4.icmp_ratelimit = 1000
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.secure_redirects = 0
 net.ipv4.conf.default.secure_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.log_martians = 1
-net.ipv4.conf.default.log_martians = 1
 
-# Limites fichiers (optimise pour ${RAM_GB} Go RAM)
-fs.file-max = ${FILE_MAX}
-fs.inotify.max_user_watches = ${INOTIFY_WATCHES}
+# rp_filter loose (2) et NON strict (1) : le mode strict casse le routage
+# asymétrique des bridges Docker (trafic Gluetun compris).
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+
+# log_martians coupé : bridges Docker + tunnels génèrent des faux positifs
+# qui satureraient /var/log.
+net.ipv4.conf.all.log_martians = 0
+net.ipv4.conf.default.log_martians = 0
+
+# --- Limites fichiers --------------------------------------------------------
+fs.file-max = ${OPT_FILE_MAX}
+fs.inotify.max_user_watches = ${OPT_INOTIFY_WATCHES}
 fs.inotify.max_user_instances = 1024
 fs.aio-max-nr = 1048576
 
-# IPv6
+# --- IPv6 --------------------------------------------------------------------
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_source_route = 0
 net.ipv6.conf.default.accept_source_route = 0
+net.ipv6.conf.all.forwarding = 1
 EOF
 
-    print_success "Configuration sysctl generee"
-    
-    # =========================================================================
-    # APPLICATION SYSCTL
-    # =========================================================================
-    print_step "APPLICATION DES PARAMETRES KERNEL"
-    
-    print_substep "Application de ${SYSCTL_FILE}..."
-    print_applying
-    sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || print_warning "Certains parametres ignores (normal)"
-    print_success "Parametres kernel appliques"
-    
-    # =========================================================================
-    # LIMITES SYSTEME
-    # =========================================================================
-    print_step "CONFIGURATION DES LIMITES SYSTEME"
-    
-    print_substep "Optimisation des limites pour ${RAM_GB} Go RAM..."
-    sleep 0.5
-    
-    cat > "$LIMITS_FILE" << EOF
-# LABOBOX - LIMITES SYSTEME
-# Configuration pour ${RAM_GB} Go RAM
+    if [[ "$profile" == "pve-host" ]]; then
+        cat << 'EOF'
 
-*               soft    nofile          1048576
-*               hard    nofile          1048576
-root            soft    nofile          1048576
+# --- Spécifique hôte Proxmox -------------------------------------------------
+# Les clés net.bridge.bridge-nf-call-* ne sont PAS touchées : pve-firewall
+# en dépend pour filtrer le trafic des VM.
+EOF
+    fi
+}
+
+#--- Rendu du script de tuning NIC (rejoué à chaque boot) ----------------------
+# Attend que le lien soit réellement négocié, puis règle : files matérielles
+# (multiqueue), ring buffers, offloads (dont UDP-GRO forwarding, décisif pour
+# le trafic WireGuard routé vers Gluetun), affinité des IRQ, RPS/XPS.
+# Conscient du profil : sur un hôte Proxmox, il vise la carte physique sous
+# le bridge et laisse irqbalance répartir les IRQ entre les VM.
+opt_render_nic_tune() {
+    local profile="$1"
+    cat << 'TUNE_HEAD'
+#!/bin/bash
+###############################################################################
+# LaboBox-VPN — tuning matériel de la carte réseau (généré, rejoué au boot).
+# Best effort : aucune erreur ne doit empêcher le démarrage de la machine.
+###############################################################################
+TUNE_HEAD
+    echo "PROFILE=\"$profile\""
+    cat << 'TUNE_EOF'
+
+# --- Attente que le lien soit RÉELLEMENT opérationnel ------------------------
+# network-online.target ne garantit pas que la négociation du lien soit
+# terminée, et plusieurs pilotes réinitialisent leurs ring buffers au
+# link-up : on attend donc operstate=up nous-mêmes (30 s max).
+NIC=""
+for _try in $(seq 1 30); do
+    NIC=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    if [ -z "$NIC" ]; then
+        NIC=$(ip -o link show up 2>/dev/null \
+              | awk -F': ' '$2 !~ /^(lo|wg|docker|br-|veth|ifb|tun|tap|vir)/{print $2; exit}')
+    fi
+    if [ -n "$NIC" ] && [ "$(cat "/sys/class/net/$NIC/operstate" 2>/dev/null)" = "up" ]; then
+        break
+    fi
+    sleep 1
+done
+[ -z "$NIC" ] || [ ! -d "/sys/class/net/$NIC" ] && { echo "nic-tune: aucune interface exploitable" >&2; exit 0; }
+
+# Hôte Proxmox : la route passe par le bridge vmbr0, le matériel à régler est
+# la carte physique membre du bridge.
+if [ -d "/sys/class/net/$NIC/brif" ]; then
+    for port in "/sys/class/net/$NIC/brif"/*; do
+        [ -e "$port" ] || continue
+        port=$(basename "$port")
+        if [ -d "/sys/class/net/$port/device" ]; then
+            NIC="$port"
+            break
+        fi
+    done
+fi
+
+sleep 2   # laisse le pilote terminer sa séquence de link-up
+echo "nic-tune: interface ${NIC} (profil ${PROFILE})"
+NUM_CPUS=$(nproc)
+
+if command -v ethtool >/dev/null 2>&1; then
+    # --- Files matérielles (channels) : une par cœur, AVANT les rings --------
+    # Réglage crucial et souvent oublié : une carte 10G — ou une vNIC virtio
+    # dont le Multiqueue est configuré côté Proxmox — expose souvent moins
+    # de files ACTIVES que possible. Sans « ethtool -L », le multiqueue
+    # n'est tout simplement pas utilisé. À faire avant les ring buffers :
+    # changer les channels peut les réinitialiser.
+    MAX_COMB=$(ethtool -l "$NIC" 2>/dev/null | awk '/Pre-set/,/Current/' | awk '/^Combined:/{print $2; exit}')
+    CUR_COMB=$(ethtool -l "$NIC" 2>/dev/null | awk '/Current/,0'      | awk '/^Combined:/{print $2; exit}')
+    if [ -n "$MAX_COMB" ] && [ "$MAX_COMB" != "n/a" ] && [ "$MAX_COMB" -ge 1 ] 2>/dev/null; then
+        TARGET_COMB=$MAX_COMB
+        [ "$NUM_CPUS" -lt "$TARGET_COMB" ] && TARGET_COMB=$NUM_CPUS
+        if [ -n "$CUR_COMB" ] && [ "$CUR_COMB" != "$TARGET_COMB" ]; then
+            if ethtool -L "$NIC" combined "$TARGET_COMB" >/dev/null 2>&1; then
+                echo "nic-tune: files combinées ${CUR_COMB} → ${TARGET_COMB}"
+            fi
+        fi
+    fi
+
+    # --- Ring buffers : au maximum supporté par le pilote --------------------
+    MAX_RX=$(ethtool -g "$NIC" 2>/dev/null | awk '/Pre-set/,/Current/' | awk '/^RX:/{print $2; exit}')
+    MAX_TX=$(ethtool -g "$NIC" 2>/dev/null | awk '/Pre-set/,/Current/' | awk '/^TX:/{print $2; exit}')
+    CUR_RX=$(ethtool -g "$NIC" 2>/dev/null | awk '/Current/,0'      | awk '/^RX:/{print $2; exit}')
+    CUR_TX=$(ethtool -g "$NIC" 2>/dev/null | awk '/Current/,0'      | awk '/^TX:/{print $2; exit}')
+    # On ne touche la carte que si la valeur change : un ethtool -G inutile
+    # peut provoquer un reset du lien pour rien.
+    if [ -n "$MAX_RX" ] && [ "$MAX_RX" != "n/a" ] && [ "$MAX_RX" != "$CUR_RX" ]; then
+        ethtool -G "$NIC" rx "$MAX_RX" >/dev/null 2>&1 || echo "nic-tune: ethtool -G rx refusé (normal sur certains virtio)" >&2
+    fi
+    if [ -n "$MAX_TX" ] && [ "$MAX_TX" != "n/a" ] && [ "$MAX_TX" != "$CUR_TX" ]; then
+        ethtool -G "$NIC" tx "$MAX_TX" >/dev/null 2>&1 || echo "nic-tune: ethtool -G tx refusé" >&2
+    fi
+
+    # --- Offloads ------------------------------------------------------------
+    # GRO/TSO/GSO/SG : indispensables pour du multi-gigabit sans brûler le CPU.
+    ethtool -K "$NIC" gro on tso on gso on sg on >/dev/null 2>&1 || true
+    # LRO : fusionne les paquets de façon irréversible → corrompt le trafic
+    # ROUTÉ (donc tout ce qui part vers les conteneurs). Toujours coupé.
+    ethtool -K "$NIC" lro off >/dev/null 2>&1 || true
+    # UDP GRO forwarding : gros gain pour le trafic UDP routé/chiffré comme
+    # le WireGuard des Gluetun. rx-gro-list doit être coupé en même temps.
+    ethtool -K "$NIC" rx-udp-gro-forwarding on rx-gro-list off >/dev/null 2>&1 || true
+
+    # Coalescing adaptatif : compromis débit/latence géré par le pilote.
+    ethtool -C "$NIC" adaptive-rx on adaptive-tx on >/dev/null 2>&1 || true
+fi
+
+# --- Affinité IRQ / RPS / XPS ------------------------------------------------
+# Hôte Proxmox : irqbalance reste en charge (répartition entre les VM) — on
+# ne touche ni aux IRQ ni à RPS/XPS.
+if [ "$PROFILE" != "pve-host" ]; then
+    # Une file par cœur, en round-robin, uniquement les IRQ de la carte.
+    IRQS=$(grep -E "[[:space:]]${NIC}(-|$|[[:space:]])" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' ')
+    CPU=0
+    for IRQ in $IRQS; do
+        if [ -w "/proc/irq/$IRQ/smp_affinity_list" ]; then
+            echo "$CPU" > "/proc/irq/$IRQ/smp_affinity_list" 2>/dev/null || true
+            CPU=$(( (CPU + 1) % NUM_CPUS ))
+        fi
+    done
+
+    # RPS : utile UNIQUEMENT en mono-file. Sur du multi-file (RSS matériel ou
+    # virtio multiqueue), l'activer ajouterait du travail inter-cœurs.
+    RX_QUEUES=$(ls -d /sys/class/net/"$NIC"/queues/rx-* 2>/dev/null | wc -l)
+    if [ "$RX_QUEUES" -le 1 ]; then
+        if [ "$NUM_CPUS" -le 32 ]; then
+            MASK=$(printf '%x' $(( (1 << NUM_CPUS) - 1 )))
+        else
+            MASK="ffffffff,ffffffff"
+        fi
+        for Q in /sys/class/net/"$NIC"/queues/rx-*/rps_cpus; do
+            [ -w "$Q" ] && echo "$MASK" > "$Q" 2>/dev/null
+        done
+        [ -w /proc/sys/net/core/rps_sock_flow_entries ] && \
+            echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null
+        for Q in /sys/class/net/"$NIC"/queues/rx-*/rps_flow_cnt; do
+            [ -w "$Q" ] && echo 32768 > "$Q" 2>/dev/null
+        done
+    fi
+
+    # XPS : une file TX par cœur.
+    CPU=0
+    for Q in /sys/class/net/"$NIC"/queues/tx-*/xps_cpus; do
+        [ -w "$Q" ] || continue
+        if [ "$NUM_CPUS" -le 32 ]; then
+            printf '%x' $(( 1 << CPU )) > "$Q" 2>/dev/null || true
+        fi
+        CPU=$(( (CPU + 1) % NUM_CPUS ))
+    done
+fi
+
+exit 0
+TUNE_EOF
+}
+
+#--- Fichier de limites système ------------------------------------------------
+# « * » concerne TOUS les comptes (donc les clients SFTP) : ni memlock
+# illimité (DoS mémoire), ni nproc quasi infini (fork bomb) — seuls les
+# plafonds de root sont larges. Les conteneurs rtorrent gardent par ailleurs
+# leurs propres ulimits dans docker-compose.yml.
+opt_render_limits() {
+    cat << EOF
+# LaboBox-VPN — limites système (générées)
+*               soft    nofile          262144
+*               hard    nofile          524288
+root            soft    nofile          524288
 root            hard    nofile          1048576
-*               soft    nproc           131072
-*               hard    nproc           131072
-root            soft    nproc           131072
-root            hard    nproc           131072
-*               soft    memlock         unlimited
-*               hard    memlock         unlimited
+*               soft    nproc           8192
+*               hard    nproc           16384
+root            soft    nproc           65536
+root            hard    nproc           65536
+*               soft    memlock         65536
+*               hard    memlock         65536
+root            soft    memlock         unlimited
+root            hard    memlock         unlimited
 *               soft    stack           65536
 *               hard    stack           65536
 *               soft    core            0
 *               hard    core            0
 EOF
-    
-    print_success "Limites systeme configurees"
-    
-    # =========================================================================
-    # CARTE RESEAU
-    # =========================================================================
-    print_step "OPTIMISATION DE LA CARTE RESEAU (${MAIN_NIC})"
-    
-    if command -v ethtool &> /dev/null; then
-        print_substep "Configuration des ring buffers..."
-        sleep 0.5
-        MAX_RX=$(ethtool -g $MAIN_NIC 2>/dev/null | grep -A 4 "Pre-set" | grep "RX:" | awk '{print $2}')
-        MAX_TX=$(ethtool -g $MAIN_NIC 2>/dev/null | grep -A 4 "Pre-set" | grep "TX:" | awk '{print $2}')
-        if [ -n "$MAX_RX" ] && [ -n "$MAX_TX" ]; then
-            ethtool -G $MAIN_NIC rx $MAX_RX tx $MAX_TX >/dev/null 2>&1 || true
-            print_success "Ring buffers : RX=${MAX_RX} TX=${MAX_TX}"
-        else
-            print_success "Ring buffers : valeurs par defaut"
-        fi
-        
-        print_substep "Configuration de l'offloading..."
-        sleep 0.5
-        ethtool -K $MAIN_NIC gro on tso on gso on sg on >/dev/null 2>&1 || true
-        ethtool -K $MAIN_NIC lro off >/dev/null 2>&1 || true
-        print_success "Offloading configure (GRO, TSO, GSO actives)"
-    fi
-    
-    # =========================================================================
-    # IRQ AFFINITY
-    # =========================================================================
-    print_step "CONFIGURATION DE L'AFFINITE IRQ"
-    
-    print_substep "Repartition des interruptions sur les ${CPU_CORES} coeurs..."
-    sleep 0.5
-    
-    # S'assurer que le dossier existe
-    mkdir -p /opt/laboboxvpn/utils
-    
-    cat > /opt/laboboxvpn/utils/labobox-irq-affinity.sh << 'IRQ_SCRIPT'
-#!/bin/bash
-MAIN_NIC=$(ip route | grep default | awk '{print $5}' | head -1)
-[ -z "$MAIN_NIC" ] && MAIN_NIC="eth0"
-NUM_CPUS=$(nproc)
-IRQS=$(grep -E "$MAIN_NIC|virtio" /proc/interrupts | awk '{print $1}' | tr -d ':')
-CPU=0
-for IRQ in $IRQS; do
-    if [ -f /proc/irq/$IRQ/smp_affinity_list ]; then
-        echo $CPU > /proc/irq/$IRQ/smp_affinity_list 2>/dev/null || true
-        CPU=$(( (CPU + 1) % NUM_CPUS ))
-    fi
-done
-IRQ_SCRIPT
-    
-    chmod +x /opt/laboboxvpn/utils/labobox-irq-affinity.sh
-    /opt/laboboxvpn/utils/labobox-irq-affinity.sh 2>/dev/null || true
-    print_success "Affinite IRQ configuree"
-    
-    # =========================================================================
-    # RPS/XPS
-    # =========================================================================
-    print_step "CONFIGURATION RPS/XPS"
-    
-    print_substep "Repartition du traitement reseau sur tous les coeurs..."
-    sleep 0.5
-    
-    if [ -d /sys/class/net/$MAIN_NIC/queues ]; then
-        CPU_MASK=$(printf '%x' $((2**CPU_CORES - 1)))
-        for QUEUE in /sys/class/net/$MAIN_NIC/queues/rx-*/rps_cpus; do
-            echo $CPU_MASK > $QUEUE 2>/dev/null || true
-        done
-        CPU=0
-        for QUEUE in /sys/class/net/$MAIN_NIC/queues/tx-*/xps_cpus; do
-            echo $((2**CPU)) > $QUEUE 2>/dev/null || true
-            CPU=$(( (CPU + 1) % CPU_CORES ))
-        done
-        print_success "RPS/XPS configure (mask: ${CPU_MASK})"
-    else
-        print_success "RPS/XPS : non applicable"
-    fi
-    
-    # =========================================================================
-    # SERVICE SYSTEMD
-    # =========================================================================
-    print_step "CREATION DU SERVICE SYSTEMD"
-    
-    print_substep "Le service s'executera automatiquement au demarrage..."
-    sleep 0.5
-    
-    cat > /etc/systemd/system/labobox-optimize.service << 'SERVICE_EOF'
+}
+
+#--- Service de boot -----------------------------------------------------------
+# Les clés sysctl sont rejouées au boot par systemd-sysctl (fichier dans
+# /etc/sysctl.d) et les modules par systemd-modules-load : le service ne
+# rejoue donc que le tuning matériel de la carte, perdu à chaque démarrage.
+opt_render_service() {
+    cat << EOF
 [Unit]
-Description=LaboBox Network Optimization
-After=network-online.target
+Description=LaboBox-VPN — tuning carte réseau au boot (files, rings, offloads, IRQ)
+After=network-online.target systemd-modules-load.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/opt/laboboxvpn/utils/labobox-irq-affinity.sh
-ExecStart=/bin/bash -c 'NIC=$(ip route | grep default | awk "{print \$5}" | head -1); ethtool -K $NIC gro on tso on gso on 2>/dev/null || true'
-ExecStart=/sbin/sysctl -w net.ipv4.tcp_congestion_control=bbr
+TimeoutStartSec=120
+ExecStart=${NIC_TUNE_FILE}
 
 [Install]
 WantedBy=multi-user.target
-SERVICE_EOF
-    
-    systemctl daemon-reload
-    systemctl enable labobox-optimize.service 2>/dev/null
-    print_success "Service systemd cree et active"
+EOF
 }
 
-###############################################################################
-# RESUME FINAL
-###############################################################################
+#--- Application ---------------------------------------------------------------
+# do_apply [--yes] [--profile baremetal|vm|pve-host]
+do_apply() {
+    local assume_yes="no" profile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes) assume_yes="yes"; shift ;;
+            --profile) profile="$2"; shift 2 ;;
+            *) msg_err "Option inconnue : $1"; return 1 ;;
+        esac
+    done
 
-show_summary() {
-    echo ""
-    echo ""
-    double_line
-    echo "  VERIFICATION FINALE"
-    double_line
-    
-    print_step "CONFIGURATION APPLIQUEE"
-    print_value "RAM" "${RAM_GB} Go"
-    print_value "CPU" "${CPU_CORES} coeurs"
-    print_value "Interface" "${MAIN_NIC}"
-    
-    print_step "TCP CONGESTION"
-    local CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    if [ "$CC" = "bbr" ]; then
-        echo -e "      ${GREEN}BBR actif${NC}"
-    else
-        echo -e "      ${YELLOW}$CC${NC}"
-    fi
-    
-    print_step "BUFFERS"
-    print_value "rmem_max" "$(numfmt --to=iec $(sysctl -n net.core.rmem_max 2>/dev/null) 2>/dev/null)"
-    print_value "wmem_max" "$(numfmt --to=iec $(sysctl -n net.core.wmem_max 2>/dev/null) 2>/dev/null)"
-    
-    print_step "BACKUP"
-    print_value "Emplacement" "$BACKUP_DIR"
-    print_value "Restaurer" "network-optimize.sh --restore"
-    
-    echo ""
-    double_line
-    echo "  OPTIMISATION TERMINEE AVEC SUCCES !"
-    double_line
-    echo ""
-    print_info "Un reboot est recommande pour appliquer toutes les modifications."
-    echo ""
-    echo "  Commandes utiles :"
-    echo ""
-    printf "      %-45s %s\n" "reboot" "# Redemarrer le serveur"
-    printf "      %-45s %s\n" "network-optimize.sh --status" "# Voir le statut actuel"
-    printf "      %-45s %s\n" "network-optimize.sh --restore" "# Restaurer les parametres"
-    echo ""
-}
+    require_root
+    detect_env
+    [[ -z "$profile" ]] && profile="$OPT_ENV"
+    case "$profile" in baremetal|vm|pve-host) ;; *) msg_err "Profil inconnu : $profile"; return 1 ;; esac
 
-###############################################################################
-# MAIN - OPTIMIZE
-###############################################################################
-
-do_optimize() {
     print_header
-    echo "  OPTIMISATION RESEAU AUTOMATIQUE"
-    line
+    print_section "Optimisation réseau & stockage — profil : $profile" \
+        "Analyse le matériel (CPU, RAM, carte réseau) et règle réseau + writeback NFS"
+    opt_compute
+    detect_interface
+    echo "  CPU : ${OPT_CPU_CORES} cœurs   RAM : ${OPT_RAM_GB} Go   Interface : ${WAN_IF} ${WAN_DRIVER:+($WAN_DRIVER)}"
+    echo "  Writeback NFS : flush dès $(fmt_bytes "$OPT_DIRTY_BG_BYTES"), plafond $(fmt_bytes "$OPT_DIRTY_BYTES")"
     echo ""
-    print_info "Ce module va analyser votre systeme et appliquer"
-    print_info "les optimisations reseau adaptees a votre configuration."
-    echo ""
-    sleep 1.5
-    
-    # Verification root
-    if [ "$(id -u)" != "0" ]; then
-        print_error "Ce script doit etre execute en root"
-        exit 1
+
+    if [[ "$profile" == "pve-host" ]]; then
+        msg_warn "Hôte Proxmox détecté : la seedbox est prévue pour tourner dans une VM."
+        msg_info "Le profil pve-host reste applicable (tuning adapté, irqbalance conservé)."
+        echo ""
     fi
-    
-    # Verification des dependances
-    if ! command -v numfmt &> /dev/null; then
-        print_warning "numfmt non trouve, installation de coreutils..."
-        apt-get update -qq >/dev/null 2>&1
-        apt-get install -y -qq coreutils >/dev/null 2>&1
-        if ! command -v numfmt &> /dev/null; then
-            print_error "Impossible d'installer numfmt (coreutils)"
-            print_info "Les valeurs seront affichees en bytes"
-        else
-            print_success "coreutils installe"
+
+    if [[ "$assume_yes" != "yes" ]]; then
+        msg_warn "Le réglage des ring buffers peut réinitialiser brièvement le lien réseau."
+        msg_warn "En SSH, lance ceci depuis tmux/screen."
+        ask_yn "Appliquer l'optimisation ?" "o" || { msg_info "Annulé."; return 0; }
+        echo ""
+    fi
+
+    apt_ensure ethtool conntrack || true
+
+    # Sauvegarde unique de l'état sysctl d'origine, jamais écrasée par les
+    # applications suivantes : c'est LA référence d'avant toute optimisation.
+    mkdir -p "$BACKUP_DIR" "$UTILS_DIR"
+    if [[ ! -d "$BACKUP_DIR/sysctl-origin" ]]; then
+        mkdir -p "$BACKUP_DIR/sysctl-origin"
+        sysctl -a > "$BACKUP_DIR/sysctl-origin/sysctl-all.txt" 2>/dev/null || true
+        [[ -f /etc/sysctl.conf ]] && cp /etc/sysctl.conf "$BACKUP_DIR/sysctl-origin/" 2>/dev/null
+        msg_ok "État sysctl d'origine sauvegardé ($BACKUP_DIR/sysctl-origin)."
+    fi
+
+    # Fichiers des anciennes versions : retirés AVANT d'appliquer, sinon les
+    # deux générations de réglages se marchent dessus au prochain boot.
+    local legacy removed=""
+    for legacy in "${LEGACY_FILES[@]}"; do
+        [[ -f "$legacy" ]] && { rm -f "$legacy"; removed="${removed}${legacy} "; }
+    done
+    [[ -n "$removed" ]] && msg_ok "Anciens fichiers retirés : $removed"
+
+    # nf_conntrack doit être chargé MAINTENANT, sinon le kernel refuse les
+    # clés nf_conntrack_* au moment du sysctl -p.
+    modprobe nf_conntrack 2>/dev/null || true
+    write_file "$MODPROBE_FILE" 644 << EOF
+# LaboBox-VPN — hashsize conntrack aligné sur nf_conntrack_max (généré)
+options nf_conntrack hashsize=${OPT_CONNTRACK_BUCKETS}
+EOF
+    if [[ -w /sys/module/nf_conntrack/parameters/hashsize ]]; then
+        echo "$OPT_CONNTRACK_BUCKETS" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+    fi
+    local mod
+    for mod in tcp_bbr nf_conntrack; do
+        grep -qx "$mod" "$MODULES_FILE" 2>/dev/null || echo "$mod" >> "$MODULES_FILE"
+    done
+
+    # BBR, ou repli sur cubic si le noyau ne le propose pas
+    local cc_algo
+    cc_algo=$(opt_cc_algo)
+    [[ "$cc_algo" == "bbr" ]] || msg_warn "BBR indisponible sur ce noyau : cubic conservé."
+
+    # Rendus + application
+    opt_render_sysctl "$profile" "$cc_algo" | write_file "$SYSCTL_FILE" 644 || return 1
+    opt_render_limits | write_file "$LIMITS_FILE" 644 || return 1
+    opt_render_nic_tune "$profile" | write_file "$NIC_TUNE_FILE" 755 || return 1
+
+    local errors
+    errors=$(sysctl -p "$SYSCTL_FILE" 2>&1 >/dev/null | grep -v '^$' || true)
+    if [[ -n "$errors" ]]; then
+        msg_warn "Clés refusées par ce noyau (sans conséquence) :"
+        echo "$errors" | sed 's/^/    /'
+    fi
+    msg_ok "Paramètres kernel appliqués."
+
+    local active_cc
+    active_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [[ "$active_cc" == "bbr" ]]; then
+        msg_ok "Contrôle de congestion actif : bbr"
+    else
+        msg_warn "Contrôle de congestion actif : ${active_cc:-inconnu}"
+    fi
+
+    # Tuning NIC immédiat (le même script sera rejoué à chaque boot)
+    "$NIC_TUNE_FILE" 2>/dev/null || true
+    msg_ok "Tuning carte réseau appliqué (offloads, UDP-GRO forwarding, files)."
+
+    # irqbalance : désactivé quand le script fixe lui-même l'affinité des IRQ
+    # (il l'écraserait en continu) ; conservé sur un hôte Proxmox.
+    if [[ "$profile" == "pve-host" ]]; then
+        msg_info "Hôte Proxmox : irqbalance conservé (répartition multi-VM)."
+    elif systemctl is-active --quiet irqbalance 2>/dev/null; then
+        systemctl disable --now irqbalance >/dev/null 2>&1 || true
+        msg_ok "irqbalance désactivé (il écraserait l'affinité IRQ fixée). Rétabli par --restore."
+    fi
+
+    # Service de boot (rejoue le tuning NIC à chaque démarrage)
+    opt_render_service | write_file "$SERVICE_FILE" 644 || return 1
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable labobox-optimize.service >/dev/null 2>&1 || true
+    msg_ok "Service de boot installé : labobox-optimize.service"
+
+    # Mémorise l'état de l'optimiseur
+    write_file "$STATE_FILE" 600 << EOF
+# LaboBox-VPN — état de l'optimiseur (généré)
+OPT_APPLIED="yes"
+OPT_PROFILE="$profile"
+OPT_DATE="$(date '+%Y-%m-%d %H:%M')"
+OPT_CPU_CORES="$OPT_CPU_CORES"
+OPT_RAM_GB="$OPT_RAM_GB"
+EOF
+
+    # Conseils que le script ne peut pas appliquer lui-même (côté hyperviseur)
+    if [[ "$OPT_ENV" == "vm" ]]; then
+        local queues
+        queues=$(ls -d "/sys/class/net/$WAN_IF/queues/rx-"* 2>/dev/null | wc -l)
+        if [[ "$queues" -le 1 && "$OPT_CPU_CORES" -gt 1 ]]; then
+            echo ""
+            msg_warn "Cette VM n'a qu'UNE file réseau pour ${OPT_CPU_CORES} vCPU."
+            msg_info "Côté Proxmox : Hardware → Network Device → Multiqueue = ${OPT_CPU_CORES}"
+            msg_info "(et CPU type 'host' pour AES-NI/AVX → chiffrement WireGuard bien plus rapide)."
         fi
     fi
-    
-    # Backup si necessaire
-    if [ ! -d "$BACKUP_DIR" ]; then
-        do_backup
-    else
-        print_info "Backup existant trouve, conservation..."
-    fi
-    
-    # Detection et calcul
-    detect_and_calculate
-    
-    # Application
-    apply_optimizations
-    
-    # Resume
-    show_summary
+
+    echo ""
+    msg_ok "Optimisation appliquée (profil $profile). Un reboot est conseillé pour les limites."
+    echo ""
+    return 0
 }
 
-###############################################################################
-# MAIN
-###############################################################################
+#--- Restauration --------------------------------------------------------------
+# Retire tous les fichiers générés (anciennes versions comprises) et remet
+# les valeurs par défaut de Debian pour les clés les plus impactantes.
+do_restore() {
+    require_root
+    print_header
+    print_section "Restauration des paramètres d'origine"
 
+    rm -f "$SYSCTL_FILE" "$LIMITS_FILE" "$MODPROBE_FILE" "$NIC_TUNE_FILE"
+    local legacy
+    for legacy in "${LEGACY_FILES[@]}"; do
+        rm -f "$legacy"
+    done
+    if [[ -f "$MODULES_FILE" ]]; then
+        sed -i '/^tcp_bbr$/d;/^nf_conntrack$/d' "$MODULES_FILE"
+        [[ -s "$MODULES_FILE" ]] || rm -f "$MODULES_FILE"
+    fi
+
+    systemctl disable --now labobox-optimize.service >/dev/null 2>&1 || true
+    rm -f "$SERVICE_FILE"
+    systemctl daemon-reload 2>/dev/null || true
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^irqbalance.service'; then
+        systemctl enable --now irqbalance >/dev/null 2>&1 || true
+        msg_ok "irqbalance réactivé."
+    fi
+
+    # Valeurs par défaut de Debian pour les clés les plus impactantes.
+    # Remettre dirty_ratio / dirty_background_ratio remet aussi à zéro les
+    # clés *_bytes (elles sont mutuellement exclusives dans le noyau).
+    sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+    sysctl -w net.core.rmem_max=212992 >/dev/null 2>&1 || true
+    sysctl -w net.core.wmem_max=212992 >/dev/null 2>&1 || true
+    sysctl -w net.core.rmem_default=212992 >/dev/null 2>&1 || true
+    sysctl -w net.core.wmem_default=212992 >/dev/null 2>&1 || true
+    sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
+    sysctl -w vm.dirty_ratio=20 >/dev/null 2>&1 || true
+    sysctl -w vm.dirty_background_ratio=10 >/dev/null 2>&1 || true
+    sysctl -w vm.dirty_expire_centisecs=3000 >/dev/null 2>&1 || true
+    sysctl -w vm.dirty_writeback_centisecs=500 >/dev/null 2>&1 || true
+
+    write_file "$STATE_FILE" 600 << EOF
+OPT_APPLIED="no"
+OPT_PROFILE=""
+EOF
+
+    # Le forwarding IP reste requis tant que Docker fait tourner les clients
+    if command -v docker >/dev/null 2>&1; then
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+        msg_info "Forwarding IP conservé (Docker/Gluetun en dépendent)."
+    fi
+
+    msg_ok "Paramètres d'origine restaurés. Un reboot est recommandé."
+    echo ""
+    return 0
+}
+
+#--- Statut --------------------------------------------------------------------
+do_status() {
+    print_header
+    OPT_APPLIED="no"; OPT_PROFILE=""; OPT_DATE=""
+    # shellcheck disable=SC1090
+    [[ -f "$STATE_FILE" ]] && source "$STATE_FILE"
+
+    echo "  ${C_BOLD}Optimisation réseau & stockage :${C_NC}"
+    if [[ "$OPT_APPLIED" == "yes" && -f "$SYSCTL_FILE" ]]; then
+        echo "    État        : ${C_GREEN}appliquée${C_NC} (profil $OPT_PROFILE, le $OPT_DATE)"
+    elif [[ -f "/etc/sysctl.d/99-labobox-ultimate.conf" || -f "/etc/sysctl.d/99-labobox-storage.conf" ]]; then
+        echo "    État        : ${C_YELLOW}ancienne version détectée${C_NC} — relance l'application"
+    else
+        echo "    État        : ${C_YELLOW}non appliquée${C_NC}"
+    fi
+    echo "    Congestion  : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?') / qdisc $(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
+    echo "    rmem_max    : $(fmt_bytes "$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)")"
+    echo "    conntrack   : $(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo '?') / $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo '?')"
+    echo "    swappiness  : $(sysctl -n vm.swappiness 2>/dev/null || echo '?')"
+    echo ""
+
+    echo "  ${C_BOLD}Writeback disque (flush vers le NAS) :${C_NC}"
+    local dbg db dr dbr
+    dbg=$(sysctl -n vm.dirty_background_bytes 2>/dev/null || echo 0)
+    db=$(sysctl -n vm.dirty_bytes 2>/dev/null || echo 0)
+    dr=$(sysctl -n vm.dirty_ratio 2>/dev/null || echo '?')
+    dbr=$(sysctl -n vm.dirty_background_ratio 2>/dev/null || echo '?')
+    if [[ "$db" != "0" && -n "$db" ]]; then
+        echo "    Mode        : ${C_GREEN}bytes (flush continu)${C_NC}"
+        echo "    Seuil fond  : $(fmt_bytes "$dbg")"
+        echo "    Plafond     : $(fmt_bytes "$db")"
+    else
+        echo "    Mode        : ${C_YELLOW}ratio (défaut noyau — flush par rafales)${C_NC}"
+        echo "    Ratios      : background ${dbr}% / plafond ${dr}% de la RAM"
+    fi
+    echo "    En attente  : $(awk '/^Dirty:/{print $2" "$3}' /proc/meminfo 2>/dev/null || echo '?') sales, $(awk '/^Writeback:/{print $2" "$3}' /proc/meminfo 2>/dev/null || echo '?') en écriture"
+    echo ""
+
+    echo "  ${C_BOLD}Boot :${C_NC}"
+    if systemctl is-enabled --quiet labobox-optimize.service 2>/dev/null; then
+        echo "    Service     : ${C_GREEN}labobox-optimize.service activé${C_NC} (tuning NIC rejoué au boot)"
+    else
+        echo "    Service     : ${C_YELLOW}non installé${C_NC}"
+    fi
+    if [[ -d "$BACKUP_DIR/sysctl-origin" ]]; then
+        echo "    Sauvegarde  : $BACKUP_DIR/sysctl-origin (état d'avant optimisation)"
+    fi
+    echo ""
+    return 0
+}
+
+#--- Aide ----------------------------------------------------------------------
+show_help() {
+    print_header
+    echo "  Usage : network-optimize.sh [OPTION]"
+    echo ""
+    echo "    (aucune)     Appliquer l'optimisation (profil auto, confirmation demandée)"
+    echo "    --yes        Appliquer sans confirmation"
+    echo "    --profile P  Forcer le profil : baremetal | vm | pve-host"
+    echo "    --status     Afficher le statut actuel"
+    echo "    --restore    Restaurer les paramètres d'origine"
+    echo "    --help       Afficher cette aide"
+    echo ""
+    echo "  Ce que règle l'application, dimensionné sur le CPU et la RAM :"
+    echo "    - BBR + fq (repli cubic), buffers réseau, backlog, conntrack + hashsize"
+    echo "    - writeback disque en bytes : flush continu vers le NAS (ex-menu"
+    echo "      « Optimisation stockage NFS », intégré ici)"
+    echo "    - carte réseau : files multiqueue, ring buffers, offloads (UDP-GRO"
+    echo "      forwarding), affinité IRQ, RPS/XPS — rejoué à chaque boot"
+    echo "    - limites système (nofile, nproc) raisonnées"
+    echo ""
+}
+
+#--- Main ----------------------------------------------------------------------
 case "${1:-}" in
     --help|-h)
         show_help
         ;;
     --status|-s)
-        show_status
+        do_status
         ;;
     --restore|-r)
-        if [ "$(id -u)" != "0" ]; then
-            echo -e "${RED}Ce script doit etre execute en root${NC}"
-            exit 1
-        fi
         do_restore
         ;;
-    "")
-        do_optimize
+    ""|--yes|--profile)
+        do_apply "$@"
         ;;
     *)
-        echo -e "${RED}Option inconnue: $1${NC}"
-        echo "Utilisez --help pour voir les options disponibles."
+        msg_err "Option inconnue : $1"
+        echo "  Utilise --help pour voir les options disponibles."
         exit 1
         ;;
 esac

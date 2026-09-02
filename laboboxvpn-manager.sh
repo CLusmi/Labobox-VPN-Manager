@@ -35,10 +35,6 @@ NAS_IP="$DEFAULT_NAS_IP"
 NAS_MOUNT="/mnt/nas"
 NAS_SHARE_PREFIX="SEEDBOX_"
 
-# Configuration logs
-LOG_MAX_SIZE_MB=10
-LOG_ROTATE_KEEP=3
-
 # Charger la configuration si elle existe
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
@@ -76,12 +72,15 @@ NC='\033[0m'
 # FONCTIONS D'AFFICHAGE
 ###########################################
 
+# Marge gauche commune à toute l'interface (deux espaces, comme
+# Network-WireGuard-Manager) : lignes, titres et textes partent tous
+# de la même colonne.
 line() {
-    echo -e "${DIM}──────────────────────────────────────────────────────────────────────${NC}"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────${NC}"
 }
 
 double_line() {
-    echo -e "${CYAN}══════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "  ${CYAN}══════════════════════════════════════════════════════════════════════${NC}"
 }
 
 print_header() {
@@ -249,8 +248,8 @@ print_menu_option() {
     local num=$1
     local icon=$2
     local label=$3
-    # Format: numéro aligné à droite sur 2 chars, tiret, label
-    printf "     %2s  %s  %s\n" "$num" "$icon" "$label"
+    # Format: marge de 2 espaces, numéro aligné à droite sur 2 chars, tiret, label
+    printf "  %2s  %s  %s\n" "$num" "$icon" "$label"
 }
 
 print_menu_separator() {
@@ -279,9 +278,9 @@ read_input() {
     local is_password=$3
     
     if [ -n "$default" ]; then
-        echo -ne "     ${prompt} [${default}]: "
+        echo -ne "  ${prompt} [${default}]: "
     else
-        echo -ne "     ${prompt}: "
+        echo -ne "  ${prompt}: "
     fi
     
     if [ "$is_password" == "password" ]; then
@@ -527,48 +526,6 @@ format_bytes() {
     else
         echo "${bytes} B"
     fi
-}
-
-###########################################
-# FONCTIONS LOGS (ROTATION)
-###########################################
-
-rotate_logs_for_client() {
-    local client=$1
-    local log_dir="$(get_client_docker_apps_path $client)/rtorrent/log"
-    local log_file="$log_dir/rtorrent.log"
-    local max_size=$((LOG_MAX_SIZE_MB * 1024 * 1024))
-    
-    [ ! -f "$log_file" ] && return 0
-    
-    local current_size=$(stat -c%s "$log_file" 2>/dev/null || echo "0")
-    
-    if [ $current_size -ge $max_size ]; then
-        # Rotation
-        for i in $(seq $((LOG_ROTATE_KEEP - 1)) -1 1); do
-            [ -f "${log_file}.${i}" ] && mv "${log_file}.${i}" "${log_file}.$((i + 1))"
-        done
-        mv "$log_file" "${log_file}.1"
-        touch "$log_file"
-        
-        # Supprimer les anciens
-        for i in $(seq $((LOG_ROTATE_KEEP + 1)) 10); do
-            rm -f "${log_file}.${i}"
-        done
-        
-        return 1  # Rotation effectuée
-    fi
-    return 0  # Pas de rotation
-}
-
-rotate_all_logs() {
-    local rotated=0
-    for client in $(get_clients); do
-        if ! rotate_logs_for_client "$client"; then
-            ((rotated++))
-        fi
-    done
-    echo $rotated
 }
 
 ###########################################
@@ -846,16 +803,16 @@ cmd_add() {
     echo ""
     echo -e "  ${WHITE}1. Panneau de configuration → Dossier partagé → Créer${NC}"
     echo ""
-    echo -e "     Nom : ${CYAN}${NAS_SHARE_NAME}${NC}"
+    echo -e "    Nom : ${CYAN}${NAS_SHARE_NAME}${NC}"
     echo ""
     echo -e "  ${WHITE}2. Onglet Avancés :${NC}"
-    echo -e "     ✔ Activer le quota du dossier partagé"
-    echo -e "     Quota : ${CYAN}[Définir la taille souhaitée]${NC}"
+    echo -e "    ✔ Activer le quota du dossier partagé"
+    echo -e "    Quota : ${CYAN}[Définir la taille souhaitée]${NC}"
     echo ""
     echo -e "  ${WHITE}3. Onglet Autorisations NFS → Créer :${NC}"
-    echo -e "     Nom d'hôte : ${CYAN}$(hostname -I | awk '{print $1}')${NC}"
-    echo -e "     Privilège : ${CYAN}Lecture/Écriture${NC}"
-    echo -e "     Squash : ${CYAN}Mapper tous les utilisateurs sur admin${NC}"
+    echo -e "    Nom d'hôte : ${CYAN}$(hostname -I | awk '{print $1}')${NC}"
+    echo -e "    Privilège : ${CYAN}Lecture/Écriture${NC}"
+    echo -e "    Squash : ${CYAN}Mapper tous les utilisateurs sur admin${NC}"
     echo ""
     echo -e "  ${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
@@ -1595,9 +1552,9 @@ cmd_logs() {
     fi
     
     echo ""
-    echo -e "${DIM}══════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "  ${DIM}══════════════════════════════════════════════════════════════════════${NC}"
     echo -e "  ${WHITE}LOGS: ${SERVICE}-${CLIENT}${NC}"
-    echo -e "${DIM}══════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "  ${DIM}══════════════════════════════════════════════════════════════════════${NC}"
     echo ""
     
     if [ "$SERVICE" == "gluetun" ]; then
@@ -2125,10 +2082,10 @@ cmd_init() {
     echo ""
     
     if [ "$NAS_IP" = "A_CONFIGURER" ] || [ "$SERVER_IP" = "A_CONFIGURER" ]; then
-        echo -e "     ${YELLOW}⚠ Configuration réseau incomplète${NC}"
-        echo -e "     ${DIM}Utilisez les options du menu Maintenance pour configurer${NC}"
+        echo -e "       ${YELLOW}⚠ Configuration réseau incomplète${NC}"
+        echo -e "       ${DIM}Utilisez les options du menu Maintenance pour configurer${NC}"
     else
-        echo -e "     ${GREEN}✔ Configuration réseau OK${NC}"
+        echo -e "       ${GREEN}✔ Configuration réseau OK${NC}"
     fi
     
     print_step_item "IP VM" "$SERVER_IP"
@@ -2194,121 +2151,21 @@ cmd_build() {
 }
 
 ###########################################
-# COMMANDE: ROTATE-LOGS
+# OPTIMISATION RESEAU & STOCKAGE
 ###########################################
-###########################################
-# OPTIMISATION STOCKAGE NFS
-###########################################
-# Regle le writeback du noyau. Ces parametres ne sont PAS dans un namespace
-# de conteneur : ils doivent etre poses sur la VM, pas dans l'image Docker.
-#
-# Par defaut vm.dirty_ratio = 20 : avec 64 Go de RAM, jusqu'a 12,8 Go de pages
-# sales peuvent s'accumuler avant que le noyau ne bloque les ecrivains. Vider
-# ca d'un coup sur un array SHR-1 (~400 Mo/s reels) = 30 s de gel complet.
-# En bytes plutot qu'en ratio, le flush devient continu au lieu d'explosif.
+# Tout vit dans utils/network-optimize.sh (portage de l'optimiseur de
+# Network-WireGuard-Manager) : reseau ET writeback NFS dans UN SEUL fichier
+# sysctl — les deux anciens fichiers separes se contredisaient (le fichier
+# reseau, applique apres le fichier stockage, remettait vm.dirty_ratio et
+# annulait le writeback en bytes).
 
-STORAGE_SYSCTL_FILE="/etc/sysctl.d/99-labobox-storage.conf"
-
-cmd_optimize_storage() {
-    print_header_with_title "OPTIMISATION STOCKAGE NFS"
-
-    local total_ram_gb=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024 / 1024 ))
-
-    echo -e "  ${DIM}RAM detectee : ${total_ram_gb} Go${NC}"
-    echo ""
-    echo -e "  ${DIM}Ce module regle le writeback du noyau pour eviter les${NC}"
-    echo -e "  ${DIM}rafales d'ecriture qui saturent le NAS et gelent rtorrent.${NC}"
-    echo ""
-
-    if [ -f "$STORAGE_SYSCTL_FILE" ]; then
-        echo -e "  ${YELLOW}L'optimisation est deja appliquee. Elle sera remplacee.${NC}"
-        echo ""
-    fi
-
-    cat > "$STORAGE_SYSCTL_FILE" << 'SYSCTLEOF'
-# LaboBox-VPN - Optimisation stockage NFS
-# Genere par laboboxvpn-manager.sh
-
-# --- Writeback ---
-# En bytes et non en ratio : le flush devient continu au lieu d'explosif.
-vm.dirty_background_bytes = 268435456
-vm.dirty_bytes = 1073741824
-vm.dirty_expire_centisecs = 1000
-vm.dirty_writeback_centisecs = 100
-
-# --- Buffers socket ---
-# Necessaires pour que network.receive_buffer / send_buffer de rtorrent
-# ne soient pas plafonnes silencieusement par le noyau.
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 262144 16777216
-net.ipv4.tcp_wmem = 4096 262144 16777216
-net.ipv4.tcp_slow_start_after_idle = 0
-
-# --- Forte densite de connexions ---
-net.core.somaxconn = 4096
-net.ipv4.tcp_max_syn_backlog = 8192
-fs.file-max = 2097152
-SYSCTLEOF
-
-    if sysctl -p "$STORAGE_SYSCTL_FILE" > /dev/null 2>&1; then
-        print_item "Fichier" "$STORAGE_SYSCTL_FILE"
-        print_item "dirty_background" "256 Mo"
-        print_item "dirty_bytes" "1 Go"
-        print_item_last "Status" "${GREEN}✔ Applique${NC}"
-        echo ""
-        echo -e "  ${DIM}Verification pendant un download :${NC}"
-        echo -e "  ${DIM}  watch -n1 'grep -E \"^(Dirty|Writeback):\" /proc/meminfo'${NC}"
-        echo -e "  ${DIM}Dirty doit osciller autour de quelques centaines de Mo.${NC}"
+cmd_optimize() {
+    if [ -f "$UTILS_DIR/network-optimize.sh" ]; then
+        bash "$UTILS_DIR/network-optimize.sh" "$@"
     else
-        print_item_last "Status" "${RED}✗ Echec de l'application${NC}"
-        echo ""
-        echo -e "  ${DIM}Detail : sysctl -p $STORAGE_SYSCTL_FILE${NC}"
+        print_error_box "Script d'optimisation non trouvé" "└─ Copiez network-optimize.sh dans $UTILS_DIR"
+        return 1
     fi
-
-    print_footer
-}
-
-cmd_optimize_storage_status() {
-    print_header_with_title "STATUT OPTIMISATION STOCKAGE"
-
-    if [ ! -f "$STORAGE_SYSCTL_FILE" ]; then
-        echo -e "  ${YELLOW}Optimisation non appliquee${NC}"
-        echo ""
-        echo -e "  ${DIM}Valeurs actuelles du noyau :${NC}"
-    else
-        echo -e "  ${GREEN}Optimisation active${NC} ${DIM}($STORAGE_SYSCTL_FILE)${NC}"
-        echo ""
-    fi
-
-    echo ""
-    for param in vm.dirty_background_bytes vm.dirty_bytes vm.dirty_ratio \
-                 vm.dirty_background_ratio net.core.rmem_max net.core.wmem_max; do
-        local val=$(sysctl -n "$param" 2>/dev/null || echo "n/a")
-        printf "     %-32s %s\n" "$param" "$val"
-    done
-
-    echo ""
-    echo -e "  ${DIM}Pages sales en ce moment :${NC}"
-    grep -E "^(Dirty|Writeback):" /proc/meminfo | sed 's/^/     /'
-
-    print_footer
-}
-
-cmd_optimize_storage_restore() {
-    print_header_with_title "RESTAURATION STOCKAGE"
-
-    if [ -f "$STORAGE_SYSCTL_FILE" ]; then
-        rm -f "$STORAGE_SYSCTL_FILE"
-        sysctl --system > /dev/null 2>&1
-        print_item_last "Status" "${GREEN}✔ Parametres d'origine restaures${NC}"
-        echo ""
-        echo -e "  ${DIM}Un redemarrage garantit un retour complet aux defauts.${NC}"
-    else
-        print_item_last "Status" "${DIM}Rien a restaurer${NC}"
-    fi
-
-    print_footer
 }
 
 ###########################################
@@ -2324,12 +2181,12 @@ migrate_client_session() {
     local compose_file="$CLIENTS_DIR/$CLIENT/docker-compose.yml"
 
     if [ ! -f "$compose_file" ]; then
-        echo -e "     ${RED}✗${NC} $CLIENT ${DIM}(docker-compose.yml introuvable)${NC}"
+        echo -e "  ${RED}✗${NC} $CLIENT ${DIM}(docker-compose.yml introuvable)${NC}"
         return 1
     fi
 
     if grep -q ":/local" "$compose_file"; then
-        echo -e "     ${DIM}-${NC} $CLIENT ${DIM}(deja migre)${NC}"
+        echo -e "  ${DIM}-${NC} $CLIENT ${DIM}(deja migre)${NC}"
         return 0
     fi
 
@@ -2337,7 +2194,7 @@ migrate_client_session() {
     local USER_GID=$(id -g "$CLIENT" 2>/dev/null)
 
     if [ -z "$USER_UID" ]; then
-        echo -e "     ${RED}✗${NC} $CLIENT ${DIM}(utilisateur systeme introuvable)${NC}"
+        echo -e "  ${RED}✗${NC} $CLIENT ${DIM}(utilisateur systeme introuvable)${NC}"
         return 1
     fi
 
@@ -2351,10 +2208,10 @@ migrate_client_session() {
     sed -i "\|:/data\$|a\\      - ${CLIENTS_DIR}/${CLIENT}/local:/local" "$compose_file"
 
     if grep -q ":/local" "$compose_file"; then
-        echo -e "     ${GREEN}✔${NC} $CLIENT"
+        echo -e "  ${GREEN}✔${NC} $CLIENT"
         return 0
     else
-        echo -e "     ${RED}✗${NC} $CLIENT ${DIM}(insertion du volume echouee)${NC}"
+        echo -e "  ${RED}✗${NC} $CLIENT ${DIM}(insertion du volume echouee)${NC}"
         return 1
     fi
 }
@@ -2401,37 +2258,6 @@ cmd_migrate_sessions() {
     fi
 
     print_footer
-}
-
-cmd_rotate_logs() {
-    print_header_with_title "ROTATION DES LOGS"
-    
-    echo -e "  ${DIM}Taille max par fichier : ${LOG_MAX_SIZE_MB} MB${NC}"
-    echo -e "  ${DIM}Rotations conservées : ${LOG_ROTATE_KEEP}${NC}"
-    echo ""
-    
-    local total_rotated=0
-    
-    for CLIENT in $(get_clients); do
-        local log_dir="$(get_client_docker_apps_path $CLIENT)/rtorrent/log"
-        local log_file="$log_dir/rtorrent.log"
-        
-        if [ -f "$log_file" ]; then
-            local size=$(stat -c%s "$log_file" 2>/dev/null || echo "0")
-            local size_human=$(format_bytes $size)
-            
-            if ! rotate_logs_for_client "$CLIENT"; then
-                echo -e "  ${GREEN}✔${NC} ${CLIENT}: Log rotaté (était ${size_human})"
-                ((total_rotated++))
-            else
-                echo -e "  ${DIM}○${NC} ${CLIENT}: ${size_human} (pas de rotation nécessaire)"
-            fi
-        else
-            echo -e "  ${DIM}○${NC} ${CLIENT}: Pas de fichier log"
-        fi
-    done
-    
-    print_footer_with_summary "${total_rotated} fichier(s) rotaté(s)"
 }
 
 ###########################################
@@ -2773,19 +2599,19 @@ cmd_config_network() {
     echo ""
     
     # IP de la VM
-    echo -ne "     Nouvelle IP de cette VM [${current_ip}] : "
+    echo -ne "  Nouvelle IP de cette VM [${current_ip}] : "
     read input_server_ip
     [ -z "$input_server_ip" ] && input_server_ip="$current_ip"
     
     # Port SSH
-    echo -ne "     Nouveau port SSH [${current_ssh_port}] : "
+    echo -ne "  Nouveau port SSH [${current_ssh_port}] : "
     read input_ssh_port
     [ -z "$input_ssh_port" ] && input_ssh_port="$current_ssh_port"
     
     # IP du NAS
     local current_nas_ip="$NAS_IP"
     [ "$current_nas_ip" = "A_CONFIGURER" ] && current_nas_ip=""
-    echo -ne "     IP du NAS Synology [${current_nas_ip}] : "
+    echo -ne "  IP du NAS Synology [${current_nas_ip}] : "
     read input_nas_ip
     [ -z "$input_nas_ip" ] && input_nas_ip="$current_nas_ip"
     
@@ -3100,15 +2926,14 @@ cmd_help() {
     echo -e "  ${WHITE}passwd${NC}          Modifier un mot de passe"
     echo -e "  ${WHITE}mount${NC}           Monter les partages NAS"
     echo -e "  ${WHITE}health${NC}          Diagnostic complet"
-    echo -e "  ${WHITE}rotate-logs${NC}     Rotation des logs"
     echo ""
     echo -e "  ${WHITE}PERFORMANCE${NC}"
     line
     echo ""
-    echo -e "  ${WHITE}optimize-storage${NC}         Régler le writeback noyau (NFS)"
-    echo -e "  ${WHITE}optimize-storage-status${NC}  Voir les paramètres actifs"
-    echo -e "  ${WHITE}optimize-storage-restore${NC} Restaurer les valeurs d'origine"
-    echo -e "  ${WHITE}migrate-sessions${NC}         Session rtorrent sur disque local"
+    echo -e "  ${WHITE}optimize${NC}          Optimisation réseau & stockage NFS (profil auto)"
+    echo -e "  ${WHITE}optimize-status${NC}   Voir les paramètres actifs"
+    echo -e "  ${WHITE}optimize-restore${NC}  Restaurer les valeurs d'origine"
+    echo -e "  ${WHITE}migrate-sessions${NC}  Session rtorrent sur disque local"
     echo ""
     echo -e "  ${WHITE}APPLICATIONS${NC}"
     line
@@ -3269,9 +3094,9 @@ cmd_uninstall_jellyfin() {
     
     echo ""
     echo -e "  ${YELLOW}⚠ Cette action va supprimer :${NC}"
-    echo -e "     • Le conteneur Jellyfin"
-    echo -e "     • La configuration (comptes, paramètres)"
-    echo -e "     • Le cache"
+    echo -e "    • Le conteneur Jellyfin"
+    echo -e "    • La configuration (comptes, paramètres)"
+    echo -e "    • Le cache"
     echo ""
     echo -e "  ${DIM}Les données des clients ne seront PAS supprimées.${NC}"
     echo ""
@@ -3442,9 +3267,9 @@ cmd_uninstall_plex() {
     
     echo ""
     echo -e "  ${YELLOW}⚠ Cette action va supprimer :${NC}"
-    echo -e "     • Le conteneur Plex"
-    echo -e "     • La configuration (comptes, paramètres)"
-    echo -e "     • Le cache de transcodage"
+    echo -e "    • Le conteneur Plex"
+    echo -e "    • La configuration (comptes, paramètres)"
+    echo -e "    • Le cache de transcodage"
     echo ""
     
     if ! confirm "Confirmer la désinstallation ?"; then
@@ -3559,8 +3384,8 @@ cmd_uninstall_resilio() {
     
     echo ""
     echo -e "  ${YELLOW}⚠ Cette action va supprimer :${NC}"
-    echo -e "     • Le conteneur Resilio Sync"
-    echo -e "     • La configuration"
+    echo -e "    • Le conteneur Resilio Sync"
+    echo -e "    • La configuration"
     echo ""
     
     if ! confirm "Confirmer la désinstallation ?"; then
@@ -4117,9 +3942,9 @@ interactive_main_menu() {
         # Afficher le statut système
         echo -e "  ${WHITE}STATUT SYSTÈME${NC}"
         line
-        echo -e "     ${network_status}  Configuration réseau .... ${network_label}"
-        echo -e "     ${init_status}  Initialisation .......... ${init_label}"
-        echo -e "     ${build_status}  Image Docker ............ ${build_label}"
+        echo -e "  ${network_status}  Configuration réseau .... ${network_label}"
+        echo -e "  ${init_status}  Initialisation .......... ${init_label}"
+        echo -e "  ${build_status}  Image Docker ............ ${build_label}"
         echo ""
         
         # Si système non prêt, afficher un avertissement
@@ -4539,9 +4364,9 @@ cmd_uninstall_dashboard() {
     fi
 
     echo -e "  Cette action va supprimer :"
-    echo -e "     • Le fichier config.json"
-    echo -e "     • Le binaire compilé"
-    echo -e "     • Le service systemd"
+    echo -e "    • Le fichier config.json"
+    echo -e "    • Le binaire compilé"
+    echo -e "    • Le service systemd"
     echo ""
     echo -e "  ${DIM}Les sources (main.go, templates/) seront conservées.${NC}"
     echo ""
@@ -4957,7 +4782,7 @@ interactive_app_control() {
                 print_menu_option "1" "-" "Démarrer Plex"
             fi
         else
-            echo -e "     ${DIM}1    Plex non installé${NC}"
+            echo -e "   ${DIM}1  -  Plex non installé${NC}"
         fi
         
         if is_jellyfin_installed; then
@@ -4968,7 +4793,7 @@ interactive_app_control() {
                 print_menu_option "2" "-" "Démarrer Jellyfin"
             fi
         else
-            echo -e "     ${DIM}2    Jellyfin non installé${NC}"
+            echo -e "   ${DIM}2  -  Jellyfin non installé${NC}"
         fi
         
         if is_resilio_installed; then
@@ -4979,7 +4804,7 @@ interactive_app_control() {
                 print_menu_option "3" "-" "Démarrer Resilio Sync"
             fi
         else
-            echo -e "     ${DIM}3    Resilio Sync non installé${NC}"
+            echo -e "   ${DIM}3  -  Resilio Sync non installé${NC}"
         fi
         
         if is_watchtower_installed; then
@@ -4990,7 +4815,7 @@ interactive_app_control() {
                 print_menu_option "4" "-" "Démarrer Watchtower"
             fi
         else
-            echo -e "     ${DIM}4    Watchtower non installé${NC}"
+            echo -e "   ${DIM}4  -  Watchtower non installé${NC}"
         fi
         
         print_menu_separator
@@ -5112,7 +4937,7 @@ interactive_add_client() {
     echo ""
     
     # Nom du client
-    echo -ne "     Nom du client : "
+    echo -ne "  Nom du client : "
     read client_name
     
     if [ -z "$client_name" ]; then
@@ -5128,7 +4953,7 @@ interactive_add_client() {
     fi
     
     # Mot de passe
-    echo -ne "     Mot de passe : "
+    echo -ne "  Mot de passe : "
     read -s client_pass
     echo ""
     
@@ -5151,22 +4976,22 @@ interactive_add_client() {
     echo -e "  UID/GID              : ${user_uid}"
     echo ""
     
-    echo -e "     Port WebUI [${port_webui}] : \c"
+    echo -e "  Port WebUI [${port_webui}] : \c"
     read custom_webui
     [ -n "$custom_webui" ] && port_webui=$custom_webui
     
-    echo -e "     Port rtorrent [${port_rt}] : \c"
+    echo -e "  Port rtorrent [${port_rt}] : \c"
     read custom_rt
     [ -n "$custom_rt" ] && port_rt=$custom_rt
     
-    echo -e "     UID/GID [${user_uid}] : \c"
+    echo -e "  UID/GID [${user_uid}] : \c"
     read custom_uid
     [ -n "$custom_uid" ] && user_uid=$custom_uid
     
     # Fichier VPN (EN DERNIER - pour choisir selon le port)
     echo ""
     echo -e "  ${DIM}Astuce: le fichier VPN correspond souvent au port rtorrent (ex: ${port_rt}.conf)${NC}"
-    echo -ne "     Fichier VPN (.conf) : "
+    echo -ne "  Fichier VPN (.conf) : "
     read vpn_config
     
     if [ ! -f "$vpn_config" ]; then
@@ -5212,7 +5037,7 @@ interactive_remove_client() {
     
     echo -e "  ${DIM}Clients disponibles : $(echo $clients | tr '\n' ' ')${NC}"
     echo ""
-    echo -ne "     Nom du client à supprimer : "
+    echo -ne "  Nom du client à supprimer : "
     read client_name
     
     if [ -z "$client_name" ]; then
@@ -5235,7 +5060,7 @@ interactive_status_client() {
     
     echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
     echo ""
-    echo -ne "     Nom du client : "
+    echo -ne "  Nom du client : "
     read client_name
     
     if [ -n "$client_name" ]; then
@@ -5258,7 +5083,7 @@ interactive_start_client() {
     echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
     echo -e "  ${DIM}(laisser vide pour démarrer tous)${NC}"
     echo ""
-    echo -ne "     Nom du client : "
+    echo -ne "  Nom du client : "
     read client_name
     
     cmd_start "$client_name"
@@ -5278,7 +5103,7 @@ interactive_stop_client() {
     echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
     echo -e "  ${DIM}(laisser vide pour arrêter tous)${NC}"
     echo ""
-    echo -ne "     Nom du client : "
+    echo -ne "  Nom du client : "
     read client_name
     
     cmd_stop "$client_name"
@@ -5298,7 +5123,7 @@ interactive_restart_client() {
     echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
     echo -e "  ${DIM}(laisser vide pour redémarrer tous)${NC}"
     echo ""
-    echo -ne "     Nom du client : "
+    echo -ne "  Nom du client : "
     read client_name
     
     cmd_restart "$client_name"
@@ -5317,7 +5142,7 @@ interactive_passwd_client() {
     
     echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
     echo ""
-    echo -ne "     Nom du client : "
+    echo -ne "  Nom du client : "
     read client_name
     
     if [ -z "$client_name" ]; then
@@ -5330,7 +5155,7 @@ interactive_passwd_client() {
         return
     fi
     
-    echo -ne "     Nouveau mot de passe : "
+    echo -ne "  Nouveau mot de passe : "
     read -s new_pass
     echo ""
     
@@ -5356,7 +5181,7 @@ interactive_logs_client() {
     
     echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
     echo ""
-    echo -ne "     Nom du client : "
+    echo -ne "  Nom du client : "
     read client_name
     
     if [ -z "$client_name" ]; then
@@ -5373,7 +5198,7 @@ interactive_logs_client() {
     echo -e "  ${DIM}1. rtorrent (défaut)${NC}"
     echo -e "  ${DIM}2. gluetun (VPN)${NC}"
     echo ""
-    echo -ne "     Service [1]: "
+    echo -ne "  Service [1]: "
     read service_choice
     
     local service="rtorrent"
@@ -5426,29 +5251,29 @@ interactive_maintenance_menu() {
         
         # 1. Configuration réseau
         if [ "$network_done" = "yes" ]; then
-            printf "     ${WHITE}1${NC}   ${network_status}   Configurer le réseau ${DIM}(VM: ${SERVER_IP}, NAS: ${NAS_IP})${NC}\n"
+            printf "   ${WHITE}1${NC}   ${network_status}   Configurer le réseau ${DIM}(VM: ${SERVER_IP}, NAS: ${NAS_IP})${NC}\n"
         else
-            printf "     ${WHITE}1${NC}   ${network_status}   Configurer le réseau ${YELLOW}← À faire en premier${NC}\n"
+            printf "   ${WHITE}1${NC}   ${network_status}   Configurer le réseau ${YELLOW}← À faire en premier${NC}\n"
         fi
-        
+
         # 2. Init
         if [ "$init_done" = "yes" ]; then
-            printf "     ${WHITE}2${NC}   ${init_status}   Initialiser le système ${DIM}(fait)${NC}\n"
+            printf "   ${WHITE}2${NC}   ${init_status}   Initialiser le système ${DIM}(fait)${NC}\n"
         elif [ "$network_done" = "yes" ]; then
-            printf "     ${WHITE}2${NC}   ${init_status}   Initialiser le système ${YELLOW}← À faire${NC}\n"
+            printf "   ${WHITE}2${NC}   ${init_status}   Initialiser le système ${YELLOW}← À faire${NC}\n"
         else
-            printf "     ${WHITE}2${NC}   ${init_status}   Initialiser le système ${DIM}(après réseau)${NC}\n"
+            printf "   ${WHITE}2${NC}   ${init_status}   Initialiser le système ${DIM}(après réseau)${NC}\n"
         fi
-        
+
         # 3. Build
         if [ "$build_done" = "yes" ]; then
-            printf "     ${WHITE}3${NC}   ${build_status}   Construire l'image Docker ${DIM}(fait)${NC}\n"
+            printf "   ${WHITE}3${NC}   ${build_status}   Construire l'image Docker ${DIM}(fait)${NC}\n"
         elif [ "$init_done" = "yes" ]; then
-            printf "     ${WHITE}3${NC}   ${build_status}   Construire l'image Docker ${YELLOW}← À faire${NC}\n"
+            printf "   ${WHITE}3${NC}   ${build_status}   Construire l'image Docker ${YELLOW}← À faire${NC}\n"
         else
-            printf "     ${WHITE}3${NC}   ${build_status}   Construire l'image Docker ${DIM}(après init)${NC}\n"
+            printf "   ${WHITE}3${NC}   ${build_status}   Construire l'image Docker ${DIM}(après init)${NC}\n"
         fi
-        
+
         echo ""
         echo -e "  ${CYAN}Opérations :${NC}"
         print_menu_separator
@@ -5460,20 +5285,18 @@ interactive_maintenance_menu() {
         print_menu_option "8" "-" "Arrêt complet séquentiel"
         print_menu_separator
         print_menu_option "9" "-" "Monter tous les partages NAS"
-        print_menu_option "10" "-" "Rotation des logs"
-        print_menu_option "11" "-" "Optimisation réseau"
-        print_menu_option "12" "-" "Optimisation stockage NFS"
-        print_menu_option "13" "-" "Migrer les sessions vers le disque local"
+        print_menu_option "10" "-" "Optimisation réseau & stockage NFS"
+        print_menu_option "11" "-" "Migrer les sessions vers le disque local"
         print_menu_separator
-        print_menu_option "14" "-" "Désinstaller tout"
+        print_menu_option "12" "-" "Désinstaller tout"
         print_menu_separator
         print_menu_option "0" "-" "Retour"
-        
+
         read_choice "Votre choix" ""
-        
+
         case $MENU_CHOICE in
             1) cmd_config_network; press_enter ;;
-            2) 
+            2)
                 if [ "$network_done" = "no" ]; then
                     echo ""
                     echo -e "  ${YELLOW}⚠ Veuillez d'abord configurer le réseau (option 1)${NC}"
@@ -5483,7 +5306,7 @@ interactive_maintenance_menu() {
                     press_enter
                 fi
                 ;;
-            3) 
+            3)
                 if [ "$init_done" = "no" ]; then
                     echo ""
                     echo -e "  ${YELLOW}⚠ Veuillez d'abord initialiser le système (option 2)${NC}"
@@ -5499,48 +5322,9 @@ interactive_maintenance_menu() {
             7) cmd_sequential_start; press_enter ;;
             8) cmd_sequential_stop; press_enter ;;
             9) cmd_mount; press_enter ;;
-            10) cmd_rotate_logs; press_enter ;;
-            11) interactive_network_optimize_menu ;;
-            12) interactive_storage_optimize_menu ;;
-            13) cmd_migrate_sessions; press_enter ;;
-            14) cmd_uninstall; press_enter ;;
-            0|q|Q) return ;;
-            *) ;;
-        esac
-    done
-}
-
-interactive_storage_optimize_menu() {
-    while true; do
-        print_menu_header
-
-        echo -e "  ${WHITE}OPTIMISATION STOCKAGE NFS${NC}"
-        line
-        echo ""
-        echo -e "  ${DIM}Regle le writeback du noyau pour eviter les rafales${NC}"
-        echo -e "  ${DIM}d'ecriture qui saturent le NAS et gelent rtorrent.${NC}"
-        echo ""
-
-        local storage_status="${DIM}Non appliquée${NC}"
-        if [ -f "/etc/sysctl.d/99-labobox-storage.conf" ]; then
-            storage_status="${GREEN}✔ Active${NC}"
-        fi
-
-        echo -e "  Optimisation : ${storage_status}"
-        echo ""
-
-        print_menu_option "1" "-" "Appliquer l'optimisation stockage"
-        print_menu_option "2" "-" "Voir le statut actuel"
-        print_menu_option "3" "-" "Restaurer les paramètres d'origine"
-        print_menu_separator
-        print_menu_option "0" "-" "Retour"
-
-        read_choice "Votre choix" ""
-
-        case $MENU_CHOICE in
-            1) cmd_optimize_storage; press_enter ;;
-            2) cmd_optimize_storage_status; press_enter ;;
-            3) cmd_optimize_storage_restore; press_enter ;;
+            10) interactive_network_optimize_menu ;;
+            11) cmd_migrate_sessions; press_enter ;;
+            12) cmd_uninstall; press_enter ;;
             0|q|Q) return ;;
             *) ;;
         esac
@@ -5550,57 +5334,39 @@ interactive_storage_optimize_menu() {
 interactive_network_optimize_menu() {
     while true; do
         print_menu_header
-        
-        echo -e "  ${WHITE}OPTIMISATION RÉSEAU${NC}"
+
+        echo -e "  ${WHITE}OPTIMISATION RÉSEAU & STOCKAGE NFS${NC}"
         line
         echo ""
-        echo -e "  ${DIM}Ce module applique des optimisations kernel pour améliorer${NC}"
-        echo -e "  ${DIM}les performances réseau (BBR, buffers TCP, etc.)${NC}"
+        echo -e "  ${DIM}Analyse le matériel (CPU, RAM, carte réseau) et applique le profil${NC}"
+        echo -e "  ${DIM}adapté : BBR, buffers dimensionnés, conntrack, tuning de la carte${NC}"
+        echo -e "  ${DIM}rejoué au boot, et writeback NFS en flux continu (plus de rafales${NC}"
+        echo -e "  ${DIM}d'écriture qui saturent le NAS et gèlent rtorrent).${NC}"
         echo ""
-        
+
         # Vérifier si déjà optimisé
         local optimize_status="${DIM}Non appliquée${NC}"
-        if [ -f "/etc/sysctl.d/99-labobox-ultimate.conf" ]; then
+        if [ -f "/etc/sysctl.d/99-labobox-network.conf" ]; then
             optimize_status="${GREEN}✔ Active${NC}"
+        elif [ -f "/etc/sysctl.d/99-labobox-ultimate.conf" ] || [ -f "/etc/sysctl.d/99-labobox-storage.conf" ]; then
+            optimize_status="${YELLOW}⚠ Ancienne version — relancer l'application${NC}"
         fi
-        
+
         echo -e "  Optimisation : ${optimize_status}"
         echo ""
-        
-        print_menu_option "1" "-" "Appliquer l'optimisation réseau"
+
+        print_menu_option "1" "-" "Appliquer l'optimisation"
         print_menu_option "2" "-" "Voir le statut actuel"
         print_menu_option "3" "-" "Restaurer les paramètres d'origine"
         print_menu_separator
         print_menu_option "0" "-" "Retour"
-        
+
         read_choice "Votre choix" ""
-        
+
         case $MENU_CHOICE in
-            1)
-                if [ -f "$UTILS_DIR/network-optimize.sh" ]; then
-                    bash "$UTILS_DIR/network-optimize.sh"
-                else
-                    echo -e "  ${RED}Script d'optimisation non trouvé${NC}"
-                    echo -e "  ${DIM}Copiez network-optimize.sh dans $UTILS_DIR${NC}"
-                fi
-                press_enter
-                ;;
-            2)
-                if [ -f "$UTILS_DIR/network-optimize.sh" ]; then
-                    bash "$UTILS_DIR/network-optimize.sh" --status
-                else
-                    echo -e "  ${RED}Script d'optimisation non trouvé${NC}"
-                fi
-                press_enter
-                ;;
-            3)
-                if [ -f "$UTILS_DIR/network-optimize.sh" ]; then
-                    bash "$UTILS_DIR/network-optimize.sh" --restore
-                else
-                    echo -e "  ${RED}Script d'optimisation non trouvé${NC}"
-                fi
-                press_enter
-                ;;
+            1) cmd_optimize; press_enter ;;
+            2) cmd_optimize --status; press_enter ;;
+            3) cmd_optimize --restore; press_enter ;;
             0|q|Q) return ;;
             *) ;;
         esac
@@ -5748,17 +5514,15 @@ case "${1}" in
     health)
         cmd_health
         ;;
-    rotate-logs)
-        cmd_rotate_logs
+    optimize)
+        shift
+        cmd_optimize "$@"
         ;;
-    optimize-storage)
-        cmd_optimize_storage
+    optimize-status)
+        cmd_optimize --status
         ;;
-    optimize-storage-status)
-        cmd_optimize_storage_status
-        ;;
-    optimize-storage-restore)
-        cmd_optimize_storage_restore
+    optimize-restore)
+        cmd_optimize --restore
         ;;
     migrate-sessions)
         cmd_migrate_sessions
