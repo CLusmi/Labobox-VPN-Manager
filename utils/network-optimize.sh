@@ -552,7 +552,13 @@ fi
 # ne touche ni aux IRQ ni à RPS/XPS.
 if [ "$PROFILE" != "pve-host" ]; then
     # Une file par cœur, en round-robin, uniquement les IRQ de la carte.
-    IRQS=$(grep -E "[[:space:]]${NIC}(-|$|[[:space:]])" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' ')
+    # Sur une vNIC virtio (VM Proxmox), les IRQ n'apparaissent pas sous le
+    # nom de l'interface (ens18) mais sous celui du périphérique
+    # (virtio0-input.N / virtio0-output.N) : on résout le bon motif.
+    IRQ_PAT="$NIC"
+    VDEV=$(basename "$(readlink -f "/sys/class/net/$NIC/device" 2>/dev/null)" 2>/dev/null)
+    case "$VDEV" in virtio*) IRQ_PAT="$VDEV" ;; esac
+    IRQS=$(grep -E "[[:space:]]${IRQ_PAT}(-|\.|$|[[:space:]])" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' ')
     CPU=0
     for IRQ in $IRQS; do
         if [ -w "/proc/irq/$IRQ/smp_affinity_list" ]; then
@@ -651,7 +657,13 @@ do_apply() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --yes) assume_yes="yes"; shift ;;
-            --profile) profile="$2"; shift 2 ;;
+            --profile)
+                profile="${2:-}"
+                if [[ -z "$profile" ]]; then
+                    msg_err "--profile attend une valeur : baremetal | vm | pve-host"
+                    return 1
+                fi
+                shift 2 ;;
             *) msg_err "Option inconnue : $1"; return 1 ;;
         esac
     done
@@ -854,7 +866,7 @@ do_status() {
     print_header
     OPT_APPLIED="no"; OPT_PROFILE=""; OPT_DATE=""
     # shellcheck disable=SC1090
-    [[ -f "$STATE_FILE" ]] && source "$STATE_FILE"
+    [[ -r "$STATE_FILE" ]] && source "$STATE_FILE"
 
     echo "  ${C_BOLD}Optimisation réseau & stockage :${C_NC}"
     if [[ "$OPT_APPLIED" == "yes" && -f "$SYSCTL_FILE" ]]; then
