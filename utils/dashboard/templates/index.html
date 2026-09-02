@@ -968,38 +968,39 @@
         .row-service-dot.off { background: var(--accent-red); }
 
         /* --- Quota bar --- */
-        /* Empilement : barre + % au-dessus, « utilisé / total » en dessous */
+        /* Variante validée : « utilisé / total » à gauche et % à droite sur
+           la même ligne, barre pleine largeur en dessous — le même layout
+           que le bloc quota de la vue client. */
         .row-quota-wrap {
             display: flex;
             flex-direction: column;
-            gap: 0.25rem;
+            gap: 0.35rem;
             width: 100%;
             min-width: 0;
         }
 
-        .row-quota {
+        .row-quota-line {
             display: flex;
-            align-items: center;
+            justify-content: space-between;
+            align-items: baseline;
             gap: 0.6rem;
-            width: 100%;
         }
 
         .row-quota-detail {
             font-family: 'JetBrains Mono', monospace;
-            font-size: 0.65rem;
-            color: var(--text-muted);
+            font-size: 0.72rem;
+            color: var(--text-secondary);
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
         }
 
         .row-quota-bar {
-            flex: 1;
+            width: 100%;
             height: 5px;
             background: rgba(255, 255, 255, 0.06);
             border-radius: 3px;
             overflow: hidden;
-            min-width: 40px;
         }
 
         .row-quota-fill {
@@ -1019,10 +1020,9 @@
 
         .row-quota-text {
             font-family: 'JetBrains Mono', monospace;
-            font-size: 0.7rem;
+            font-size: 0.72rem;
             color: var(--text-muted);
             flex-shrink: 0;
-            width: 32px;
             text-align: right;
         }
 
@@ -2157,11 +2157,11 @@
                     <div class="row-cell">
                         {{if .QuotaTotal}}
                         <div class="row-quota-wrap">
-                            <div class="row-quota">
-                                <div class="row-quota-bar"><div class="row-quota-fill {{if ge .QuotaPercent 95.0}}critical{{else if ge .QuotaPercent 80.0}}warning{{end}}" style="width: {{.QuotaPercent}}%"></div></div>
+                            <div class="row-quota-line">
+                                <span class="row-quota-detail">{{formatBytes .QuotaUsed}} / {{formatBytes .QuotaTotal}}</span>
                                 <span class="row-quota-text">{{printf "%.0f" .QuotaPercent}}%</span>
                             </div>
-                            <span class="row-quota-detail">{{formatBytes .QuotaUsed}} / {{formatBytes .QuotaTotal}}</span>
+                            <div class="row-quota-bar"><div class="row-quota-fill {{if ge .QuotaPercent 95.0}}critical{{else if ge .QuotaPercent 80.0}}warning{{end}}" style="width: {{.QuotaPercent}}%"></div></div>
                         </div>
                         {{else}}<span class="row-quota-text">-</span>{{end}}
                     </div>
