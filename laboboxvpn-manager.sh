@@ -664,7 +664,8 @@ get_server_ip() {
 
 get_vpn_ip() {
     local client=$1
-    docker exec gluetun-$client wget -qO- https://api.ipify.org 2>/dev/null
+    # timeout : un tunnel pas encore établi ne doit pas geler l'affichage
+    timeout 10 docker exec gluetun-$client wget -qO- https://api.ipify.org 2>/dev/null
 }
 
 get_container_uptime() {
@@ -2042,6 +2043,281 @@ cmd_health() {
 }
 
 ###########################################
+# COMMANDE: CHECK-PORTS
+###########################################
+# Teste la chaîne complète depuis l'extérieur du tunnel : la connexion part
+# de la VM vers l'IP publique de sortie VPN (portée par le serveur dédié
+# NWM), y est redirigée dans le tunnel WireGuard, traverse Gluetun et
+# atteint rtorrent. Un port fermé = seedbox invisible pour les peers
+# entrants → ratios en chute silencieuse.
+# Test TCP uniquement (le port rtorrent écoute en TCP ; l'UDP ne se teste
+# pas par simple connexion, et le DHT est désactivé sur cette seedbox).
+
+cmd_check_ports() {
+    local ONLY_CLIENT="$1"
+    print_header_with_title "VÉRIFICATION DU PORT FORWARDING"
+
+    echo -e "  ${DIM}Connexion TCP réelle : VM → IP de sortie VPN → serveur VPN (NWM)${NC}"
+    echo -e "  ${DIM}→ tunnel WireGuard → Gluetun → rtorrent.${NC}"
+    echo ""
+
+    local ok=0 ko=0 skipped=0 tested=0
+    for CLIENT in $(get_clients); do
+        [ -n "$ONLY_CLIENT" ] && [ "$CLIENT" != "$ONLY_CLIENT" ] && continue
+        tested=1
+        local port_rt=$(grep "PORT_RTORRENT_VPN" "$CLIENTS_DIR/$CLIENT/info.txt" 2>/dev/null | cut -d: -f2 | tr -d ' ')
+
+        if [ -z "$port_rt" ]; then
+            echo -e "  ${YELLOW}⚠${NC} ${CLIENT} ${DIM}(port rtorrent introuvable dans info.txt)${NC}"
+            ((ko++)); continue
+        fi
+        if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "gluetun-$CLIENT"; then
+            echo -e "  ${DIM}○${NC} ${CLIENT} ${DIM}(arrêté — non testé)${NC}"
+            ((skipped++)); continue
+        fi
+
+        local vpn_ip=$(get_vpn_ip "$CLIENT")
+        if [ -z "$vpn_ip" ]; then
+            echo -e "  ${YELLOW}⚠${NC} ${CLIENT} ${DIM}(IP de sortie inconnue — tunnel pas encore établi ?)${NC}"
+            ((ko++)); continue
+        fi
+
+        if timeout 5 bash -c "</dev/tcp/${vpn_ip}/${port_rt}" 2>/dev/null; then
+            echo -e "  ${GREEN}✔${NC} ${CLIENT} — ${vpn_ip}:${port_rt} ${GREEN}ouvert${NC}"
+            ((ok++))
+        else
+            echo -e "  ${RED}✗${NC} ${CLIENT} — ${vpn_ip}:${port_rt} ${RED}fermé ou injoignable${NC}"
+            ((ko++))
+        fi
+    done
+
+    if [ $tested -eq 0 ]; then
+        if [ -n "$ONLY_CLIENT" ]; then
+            echo -e "  ${DIM}Client '${ONLY_CLIENT}' introuvable.${NC}"
+        else
+            echo -e "  ${DIM}Aucun client configuré.${NC}"
+        fi
+    fi
+
+    if [ $ko -gt 0 ]; then
+        echo ""
+        echo -e "  ${YELLOW}En cas d'échec, vérifier dans l'ordre :${NC}"
+        echo -e "    1. rtorrent démarré pour ce client (menu Monitoring → Vue d'ensemble)"
+        echo -e "    2. côté serveur VPN (nwm) : le port est bien redirigé vers ce client"
+        echo -e "    3. le fichier .conf du client correspond au bon port (${DIM}1101 ↔ 1101.conf${NC})"
+    fi
+
+    print_footer_with_summary "${ok} ouvert(s) │ ${ko} en échec │ ${skipped} non testé(s)"
+}
+
+###########################################
+# COMMANDE: BENCH (NFS / VPN)
+###########################################
+# Mesures chronométrées maison (date +%s%N) plutôt que le résumé de dd,
+# dont le format dépend de la locale.
+
+# bench_speed <octets> <nanosecondes> → « X.X Mo/s (Y Mbit/s) »
+bench_speed() {
+    awk -v b="$1" -v ns="$2" 'BEGIN{
+        s = ns / 1000000000
+        if (s <= 0) s = 0.001
+        printf "%.1f Mo/s (%.0f Mbit/s)", (b/1048576)/s, (b*8/1000000)/s
+    }'
+}
+
+cmd_bench_nfs() {
+    local CLIENT="$1"
+    local SIZE_MB="${2:-512}"
+
+    print_header_with_title "BENCHMARK NFS"
+
+    if [ -z "$CLIENT" ] || ! client_exists "$CLIENT"; then
+        print_error_box "Client requis : bench-nfs <client> [taille_mo]"
+        return 1
+    fi
+    case "$SIZE_MB" in ''|*[!0-9]*) SIZE_MB=512 ;; esac
+    [ "$SIZE_MB" -lt 64 ] && SIZE_MB=64
+
+    local mount_path=$(get_client_mount_path "$CLIENT")
+    if ! mountpoint -q "$mount_path" 2>/dev/null; then
+        print_error_box "Le partage NAS de '${CLIENT}' n'est pas monté" "└─ Menu Maintenance → Monter tous les partages NAS"
+        return 1
+    fi
+
+    # Le fichier de test compte sur le quota du partage pendant la mesure :
+    # on vérifie qu'il reste au moins 2x la taille demandée.
+    local quota_bytes=$(get_nas_quota_bytes "$CLIENT")
+    local used_bytes=$(get_nas_used_bytes "$CLIENT")
+    local need_bytes=$((SIZE_MB * 1024 * 1024 * 2))
+    if [ "$quota_bytes" -gt 0 ] && [ $((quota_bytes - used_bytes)) -lt $need_bytes ]; then
+        print_error_box "Pas assez d'espace libre sur ${CLIENT} pour un test de ${SIZE_MB} Mo"
+        return 1
+    fi
+
+    local target="${mount_path}/.labobox-bench.tmp"
+    local bytes=$((SIZE_MB * 1024 * 1024))
+    local start end
+
+    echo -e "  ${DIM}Partage : $(get_nas_share_name $CLIENT) — fichier de test : ${SIZE_MB} Mo${NC}"
+    echo -e "  ${DIM}(supprimé automatiquement à la fin)${NC}"
+    echo ""
+
+    # 1. Écriture DIRECTE (O_DIRECT) : débit brut NAS + réseau, sans le
+    #    cache de la VM — c'est la vitesse que les disques encaissent.
+    echo -ne "  ${DIM}Écriture directe (sans cache)...${NC}"
+    start=$(date +%s%N)
+    if dd if=/dev/zero of="$target" bs=1M count="$SIZE_MB" oflag=direct conv=fdatasync >/dev/null 2>&1; then
+        end=$(date +%s%N)
+        echo -e "\r  ${GREEN}✔${NC} Écriture directe (sans cache) .... $(bench_speed $bytes $((end - start)))          "
+    else
+        echo -e "\r  ${YELLOW}⚠${NC} Écriture directe refusée (O_DIRECT non supporté ici)          "
+    fi
+
+    # 2. Écriture via le cache + fdatasync : le chemin réel des applis
+    #    (rtorrent) — c'est ici que le writeback en bytes fait son effet.
+    echo -ne "  ${DIM}Écriture via cache (fdatasync)...${NC}"
+    start=$(date +%s%N)
+    if dd if=/dev/zero of="$target" bs=1M count="$SIZE_MB" conv=fdatasync >/dev/null 2>&1; then
+        end=$(date +%s%N)
+        echo -e "\r  ${GREEN}✔${NC} Écriture via cache (fdatasync) ... $(bench_speed $bytes $((end - start)))          "
+    else
+        echo -e "\r  ${RED}✗${NC} Écriture via cache : échec          "
+    fi
+
+    # 3. Lecture directe (sans le cache local, sinon on mesure la RAM).
+    echo -ne "  ${DIM}Lecture directe...${NC}"
+    start=$(date +%s%N)
+    if dd if="$target" of=/dev/null bs=1M iflag=direct >/dev/null 2>&1; then
+        end=$(date +%s%N)
+        echo -e "\r  ${GREEN}✔${NC} Lecture directe .................. $(bench_speed $bytes $((end - start)))          "
+    else
+        echo -e "\r  ${YELLOW}⚠${NC} Lecture directe non supportée ici (mesure sautée)          "
+    fi
+
+    rm -f "$target" 2>/dev/null
+
+    echo ""
+    echo -e "  ${DIM}Repère : un lien 1 Gb/s plafonne vers ~110 Mo/s ; en dessous, le${NC}"
+    echo -e "  ${DIM}goulot est côté NAS (disques/RAID) ou réseau, pas côté VM.${NC}"
+    print_footer
+}
+
+cmd_bench_vpn() {
+    local CLIENT="$1"
+    # 100 Mo servis par Cloudflare : assez gros pour lisser le démarrage TCP
+    local BENCH_URL="https://speed.cloudflare.com/__down?bytes=104857600"
+    local bytes=104857600
+    local start end
+
+    print_header_with_title "BENCHMARK DÉBIT VPN"
+
+    if [ -z "$CLIENT" ] || ! client_exists "$CLIENT"; then
+        print_error_box "Client requis : bench-vpn <client>"
+        return 1
+    fi
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "gluetun-$CLIENT"; then
+        print_error_box "Le client '${CLIENT}' est arrêté — tunnel indisponible"
+        return 1
+    fi
+
+    echo -e "  ${DIM}Téléchargement de 100 Mo (speed.cloudflare.com), deux passes :${NC}"
+    echo -e "  ${DIM}via le tunnel du client, puis en direct depuis la VM.${NC}"
+    echo ""
+
+    local vpn_ns="" direct_ns=""
+
+    echo -ne "  ${DIM}Via le tunnel VPN de ${CLIENT}...${NC}"
+    start=$(date +%s%N)
+    if timeout 180 docker exec "gluetun-$CLIENT" wget -q -O /dev/null "$BENCH_URL" 2>/dev/null; then
+        end=$(date +%s%N)
+        vpn_ns=$((end - start))
+        echo -e "\r  ${GREEN}✔${NC} Via le tunnel VPN ......... $(bench_speed $bytes $vpn_ns)          "
+    else
+        echo -e "\r  ${RED}✗${NC} Via le tunnel VPN : échec (tunnel coupé ?)          "
+    fi
+
+    echo -ne "  ${DIM}En direct depuis la VM...${NC}"
+    start=$(date +%s%N)
+    if timeout 180 wget -q -O /dev/null "$BENCH_URL" 2>/dev/null; then
+        end=$(date +%s%N)
+        direct_ns=$((end - start))
+        echo -e "\r  ${GREEN}✔${NC} En direct (sans VPN) ...... $(bench_speed $bytes $direct_ns)          "
+    else
+        echo -e "\r  ${YELLOW}⚠${NC} Test direct : échec          "
+    fi
+
+    if [ -n "$vpn_ns" ] && [ -n "$direct_ns" ] && [ "$vpn_ns" -gt 0 ]; then
+        echo ""
+        echo -e "  Coût du tunnel : $(awk -v v="$vpn_ns" -v d="$direct_ns" 'BEGIN{
+            if (v <= d) { print "négligeable sur ce test" }
+            else printf "%.0f %% plus lent que le direct", (v - d) * 100 / v
+        }')"
+        echo -e "  ${DIM}(chiffrement WireGuard + trajet via le serveur dédié : un écart${NC}"
+        echo -e "  ${DIM}modéré est normal ; un gros écart → voir CPU du dédié et MTU côté nwm)${NC}"
+    fi
+    print_footer
+}
+
+###########################################
+# DÉMARRAGE AUTOMATIQUE AU BOOT
+###########################################
+# Les docker-compose sont volontairement en « restart: no » : l'ordre
+# compte (NFS monté → Gluetun healthy → rtorrent). Ce service rejoue donc
+# le démarrage séquentiel complet après le réseau, les montages distants
+# et Docker — la seedbox redevient opérationnelle seule après une coupure.
+
+SEEDBOX_SERVICE_FILE="/etc/systemd/system/labobox-seedbox.service"
+
+is_autostart_enabled() {
+    systemctl is-enabled --quiet labobox-seedbox.service 2>/dev/null
+}
+
+cmd_autostart_enable() {
+    print_header_with_title "DÉMARRAGE AUTO AU BOOT"
+
+    cat > "$SEEDBOX_SERVICE_FILE" << EOF
+[Unit]
+Description=LaboBox-VPN — démarrage séquentiel de la seedbox au boot
+# Après le réseau, les montages _netdev (NFS) et Docker. Le démarrage
+# séquentiel remonte de toute façon lui-même les partages manquants.
+After=network-online.target remote-fs.target docker.service
+Wants=network-online.target remote-fs.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Chaque client attend son healthcheck Gluetun : marge large.
+TimeoutStartSec=1800
+ExecStart=/bin/bash ${INSTALL_DIR}/laboboxvpn-manager.sh sequential-start
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload 2>/dev/null
+    if systemctl enable labobox-seedbox.service >/dev/null 2>&1; then
+        print_item "Service" "labobox-seedbox.service"
+        print_item "Déclenchement" "à chaque boot, après réseau + NFS + Docker"
+        print_item_last "Suivi" "journalctl -u labobox-seedbox"
+        print_success_box "DÉMARRAGE AUTO ACTIVÉ"
+    else
+        print_error_box "Impossible d'activer le service (systemd indisponible ?)"
+        rm -f "$SEEDBOX_SERVICE_FILE"
+        return 1
+    fi
+    print_footer
+}
+
+cmd_autostart_disable() {
+    print_header_with_title "DÉMARRAGE AUTO AU BOOT"
+    systemctl disable labobox-seedbox.service >/dev/null 2>&1 || true
+    rm -f "$SEEDBOX_SERVICE_FILE"
+    systemctl daemon-reload 2>/dev/null || true
+    print_success "Démarrage auto désactivé (les clients ne démarreront plus seuls au boot)."
+    print_footer
+}
+
+###########################################
 # COMMANDE: INIT
 ###########################################
 cmd_init() {
@@ -2927,6 +3203,10 @@ cmd_uninstall() {
     done
     rm -rf "$INSTALL_DIR/apps" 2>/dev/null || true
     rm -f /etc/logrotate.d/laboboxvpn 2>/dev/null || true
+    # Service de démarrage auto (s'il avait été activé)
+    systemctl disable --now labobox-seedbox.service >/dev/null 2>&1 || true
+    rm -f "$SEEDBOX_SERVICE_FILE" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
     echo -e "\r  ${DIM}[${step}/${total_steps}]${NC} Suppression de la configuration ${DIM}...${NC} ${GREEN}✔${NC}"
     
     print_success_box "DÉSINSTALLATION TERMINÉE"
@@ -2979,6 +3259,9 @@ cmd_help() {
     echo -e "  ${WHITE}passwd${NC}          Modifier un mot de passe"
     echo -e "  ${WHITE}mount${NC}           Monter les partages NAS"
     echo -e "  ${WHITE}health${NC}          Diagnostic complet"
+    echo -e "  ${WHITE}check-ports${NC}     Vérifier le port forwarding [client]"
+    echo -e "  ${WHITE}autostart-enable${NC}   Démarrage auto de la seedbox au boot"
+    echo -e "  ${WHITE}autostart-disable${NC}  Désactiver le démarrage auto"
     echo ""
     echo -e "  ${WHITE}PERFORMANCE${NC}"
     line
@@ -2987,6 +3270,8 @@ cmd_help() {
     echo -e "  ${WHITE}optimize-status${NC}   Voir les paramètres actifs"
     echo -e "  ${WHITE}optimize-restore${NC}  Restaurer les valeurs d'origine"
     echo -e "  ${WHITE}migrate-sessions${NC}  Session rtorrent sur disque local"
+    echo -e "  ${WHITE}bench-nfs${NC}         Benchmark écriture/lecture NAS <client> [mo]"
+    echo -e "  ${WHITE}bench-vpn${NC}         Benchmark débit du tunnel VPN <client>"
     echo ""
     echo -e "  ${WHITE}APPLICATIONS${NC}"
     line
@@ -4065,11 +4350,13 @@ interactive_monitoring_menu() {
         print_menu_option "1" "-" "Vue d'ensemble"
         print_menu_option "2" "-" "Diagnostic système"
         print_menu_option "3" "-" "Utilisation disque"
+        print_menu_option "4" "-" "Vérifier le port forwarding (tous les clients)"
+        print_menu_option "5" "-" "Benchmarks (NFS / VPN)"
         print_menu_separator
         print_menu_option "0" "-" "Retour"
-        
+
         read_choice "Votre choix" ""
-        
+
         case $MENU_CHOICE in
             1)
                 if [ "$system_ready" = "no" ]; then
@@ -4091,6 +4378,67 @@ interactive_monitoring_menu() {
                     cmd_quota
                     press_enter
                 fi
+                ;;
+            4) cmd_check_ports; press_enter ;;
+            5) interactive_bench_menu ;;
+            0|q|Q) return ;;
+            *) ;;
+        esac
+    done
+}
+
+interactive_bench_menu() {
+    while true; do
+        print_menu_header
+
+        echo -e "  ${WHITE}BENCHMARKS${NC}"
+        line
+        echo ""
+        echo -e "  ${DIM}Mesures réelles pour valider les réglages : écriture/lecture sur le${NC}"
+        echo -e "  ${DIM}NAS (writeback), et débit à travers le tunnel VPN d'un client.${NC}"
+        echo ""
+
+        print_menu_option "1" "-" "Écriture / lecture NFS (partage d'un client)"
+        print_menu_option "2" "-" "Débit VPN d'un client (vs direct)"
+        print_menu_separator
+        print_menu_option "0" "-" "Retour"
+
+        read_choice "Votre choix" ""
+
+        case $MENU_CHOICE in
+            1)
+                local clients=$(get_clients)
+                if [ -z "$clients" ]; then
+                    echo -e "  ${DIM}Aucun client configuré.${NC}"
+                    press_enter
+                    continue
+                fi
+                echo ""
+                echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
+                echo ""
+                echo -ne "  Nom du client : "
+                read bench_client
+                [ -z "$bench_client" ] && continue
+                echo -ne "  Taille du test en Mo [512] : "
+                read bench_size
+                cmd_bench_nfs "$bench_client" "${bench_size:-512}"
+                press_enter
+                ;;
+            2)
+                local clients=$(get_clients)
+                if [ -z "$clients" ]; then
+                    echo -e "  ${DIM}Aucun client configuré.${NC}"
+                    press_enter
+                    continue
+                fi
+                echo ""
+                echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
+                echo ""
+                echo -ne "  Nom du client : "
+                read bench_client
+                [ -z "$bench_client" ] && continue
+                cmd_bench_vpn "$bench_client"
+                press_enter
                 ;;
             0|q|Q) return ;;
             *) ;;
@@ -5337,11 +5685,15 @@ interactive_maintenance_menu() {
         print_menu_option "7" "-" "Démarrage complet séquentiel"
         print_menu_option "8" "-" "Arrêt complet séquentiel"
         print_menu_separator
+        local autostart_label="Activer le démarrage auto au boot"
+        is_autostart_enabled && autostart_label="Désactiver le démarrage auto au boot ${GREEN}(actif)${NC}"
+
         print_menu_option "9" "-" "Monter tous les partages NAS"
         print_menu_option "10" "-" "Optimisation réseau & stockage NFS"
         print_menu_option "11" "-" "Migrer les sessions vers le disque local"
+        print_menu_option "12" "-" "$(echo -e "$autostart_label")"
         print_menu_separator
-        print_menu_option "12" "-" "Désinstaller tout"
+        print_menu_option "13" "-" "Désinstaller tout"
         print_menu_separator
         print_menu_option "0" "-" "Retour"
 
@@ -5377,7 +5729,15 @@ interactive_maintenance_menu() {
             9) cmd_mount; press_enter ;;
             10) interactive_network_optimize_menu ;;
             11) cmd_migrate_sessions; press_enter ;;
-            12) cmd_uninstall; press_enter ;;
+            12)
+                if is_autostart_enabled; then
+                    cmd_autostart_disable
+                else
+                    cmd_autostart_enable
+                fi
+                press_enter
+                ;;
+            13) cmd_uninstall; press_enter ;;
             0|q|Q) return ;;
             *) ;;
         esac
@@ -5579,6 +5939,31 @@ case "${1}" in
         ;;
     migrate-sessions)
         cmd_migrate_sessions
+        ;;
+    check-ports)
+        shift
+        parse_args "$@"
+        cmd_check_ports "${ARG_USER:-${OTHER_ARGS[0]:-}}"
+        ;;
+    bench-nfs)
+        shift
+        parse_args "$@"
+        if [ -n "$ARG_USER" ]; then
+            cmd_bench_nfs "$ARG_USER" "${OTHER_ARGS[0]:-}"
+        else
+            cmd_bench_nfs "${OTHER_ARGS[0]:-}" "${OTHER_ARGS[1]:-}"
+        fi
+        ;;
+    bench-vpn)
+        shift
+        parse_args "$@"
+        cmd_bench_vpn "${ARG_USER:-${OTHER_ARGS[0]:-}}"
+        ;;
+    autostart-enable)
+        cmd_autostart_enable
+        ;;
+    autostart-disable)
+        cmd_autostart_disable
         ;;
     config-network)
         cmd_config_network
