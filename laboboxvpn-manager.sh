@@ -2218,15 +2218,14 @@ cmd_bench_vpn() {
     fi
 
     # Sources de test essayées dans l'ordre : url_100mo|url_sonde_1mo|octets|nom.
-    # Une sonde de 1 Mo à timeout court sélectionne une source réellement
-    # joignable AVANT la mesure : une source morte ou filtrée ne fait plus
-    # échouer le bench, et un échec du tunnel n'est annoncé que si la même
-    # source répond en direct. En direct, IPv4 est forcé (-4) : une IPv6
-    # à moitié configurée sur la VM ferait traîner puis échouer wget.
-    # (-4 n'existe pas dans le wget busybox de Gluetun — inutile là-bas, le
-    # tunnel est de toute façon en IPv4.)
+    # Uniquement des FICHIERS STATIQUES : les endpoints dynamiques de
+    # speedtest (speed.cloudflare.com/__down) acceptent une petite sonde
+    # mais coupent les gros transferts faits au wget — vérifié en réel.
+    # La sonde de 1 Mo écarte vite une source morte, puis la MESURE
+    # elle-même bascule sur la source suivante si les 100 Mo échouent en
+    # cours de route. En direct, IPv4 est forcé (-4) ; le wget busybox de
+    # Gluetun ne l'a pas, inutile dans le tunnel (IPv4 de toute façon).
     local sources=(
-        "https://speed.cloudflare.com/__down?bytes=104857600|https://speed.cloudflare.com/__down?bytes=1048576|104857600|Cloudflare"
         "https://scaleway.testdebit.info/100M.iso|https://scaleway.testdebit.info/1M.iso|100000000|Scaleway"
         "https://proof.ovh.net/files/100Mb.dat|https://proof.ovh.net/files/1Mb.dat|104857600|OVH"
         "http://ipv4.download.thinkbroadband.com/100MB.zip|http://ipv4.download.thinkbroadband.com/1MB.zip|104857600|ThinkBroadband"
@@ -2236,38 +2235,31 @@ cmd_bench_vpn() {
     echo -e "  ${DIM}puis via le tunnel du client.${NC}"
     echo ""
 
-    # 1. Choix d'une source joignable depuis la VM (sonde 1 Mo)
-    local src url probe bytes label=""
-    echo -ne "  ${DIM}Recherche d'une source de test joignable...${NC}"
+    # 1. Trouver une source qui livre RÉELLEMENT 100 Mo en direct : la
+    #    sonde puis la mesure — un échec de mesure passe à la suivante.
+    local src url probe bytes lbl label="" vpn_ns="" direct_ns=""
     for src in "${sources[@]}"; do
-        IFS='|' read -r url probe bytes label <<< "$src"
-        if timeout 25 wget -4 -q -T 15 -t 1 -O /dev/null "$probe" 2>/dev/null; then
+        IFS='|' read -r url probe bytes lbl <<< "$src"
+        echo -ne "\r  ${DIM}Test de la source ${lbl}...${NC}                                        "
+        timeout 25 wget -4 -q -T 15 -t 1 -O /dev/null "$probe" 2>/dev/null || continue
+        echo -ne "\r  ${DIM}Mesure directe via ${lbl} (100 Mo)...${NC}                              "
+        start=$(date +%s%N)
+        if timeout 300 wget -4 -q -T 60 -t 1 -O /dev/null "$url" 2>/dev/null; then
+            end=$(date +%s%N)
+            direct_ns=$((end - start))
+            label="$lbl"
             break
         fi
-        label=""
     done
     if [ -z "$label" ]; then
-        echo -e "\r  ${RED}✗${NC} Aucune source de test joignable depuis la VM.                    "
+        echo -e "\r  ${RED}✗${NC} Aucune source n'a pu livrer 100 Mo en direct depuis la VM.              "
         echo ""
-        echo -e "  ${DIM}Aucune des 4 sources (Cloudflare, Scaleway, OVH, ThinkBroadband) ne${NC}"
-        echo -e "  ${DIM}répond. Diagnostic manuel :${NC}"
-        echo -e "  ${DIM}  wget -4 -O /dev/null 'https://speed.cloudflare.com/__down?bytes=1048576'${NC}"
+        echo -e "  ${DIM}Sources tentées : Scaleway, OVH, ThinkBroadband. Diagnostic manuel :${NC}"
+        echo -e "  ${DIM}  wget -4 -O /dev/null https://scaleway.testdebit.info/100M.iso${NC}"
         print_footer
         return 1
     fi
-    echo -e "\r  ${GREEN}✔${NC} Source retenue : ${label}                                        "
-
-    # 2. Mesure directe (la référence)
-    local vpn_ns="" direct_ns=""
-    echo -ne "  ${DIM}En direct depuis la VM (100 Mo)...${NC}"
-    start=$(date +%s%N)
-    if timeout 300 wget -4 -q -T 60 -t 1 -O /dev/null "$url" 2>/dev/null; then
-        end=$(date +%s%N)
-        direct_ns=$((end - start))
-        echo -e "\r  ${GREEN}✔${NC} En direct (sans VPN) ...... $(bench_speed $bytes $direct_ns)          "
-    else
-        echo -e "\r  ${YELLOW}⚠${NC} Mesure directe : échec en cours de transfert (source instable ?)          "
-    fi
+    echo -e "\r  ${GREEN}✔${NC} En direct (sans VPN) ...... $(bench_speed $bytes $direct_ns) ${DIM}via ${label}${NC}          "
 
     # 3. Sonde du tunnel (1 Mo) : distingue « tunnel mort » de « débit faible »
     echo -ne "  ${DIM}Sonde du tunnel de ${CLIENT}...${NC}"
@@ -2287,6 +2279,8 @@ cmd_bench_vpn() {
         echo -e "\r  ${GREEN}✔${NC} Via le tunnel VPN ......... $(bench_speed $bytes $vpn_ns)              "
     else
         echo -e "\r  ${RED}✗${NC} Mesure via le tunnel : échec en cours de transfert              "
+        echo -e "  ${DIM}La même source vient de livrer 100 Mo en direct : le transfert casse${NC}"
+        echo -e "  ${DIM}DANS le tunnel. Réessaie ; si ça persiste → CPU du dédié, MTU côté nwm.${NC}"
     fi
 
     if [ -n "$vpn_ns" ] && [ -n "$direct_ns" ] && [ "$vpn_ns" -gt 0 ]; then
