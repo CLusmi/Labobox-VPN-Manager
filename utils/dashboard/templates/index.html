@@ -1194,21 +1194,20 @@
         }
 
         /* ==================== TRACKERS SECTION ==================== */
+        /* Flex centré plutôt qu'une grille à colonnes fixes : avec des
+           colonnes 1fr, les cartes restantes s'alignaient à gauche. Ici
+           chaque rangée est centrée quel que soit le nombre de trackers,
+           et le passage à la ligne remplace les media queries. */
         .trackers-grid {
-            display: grid;
-            grid-template-columns: repeat(8, 1fr);
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
             gap: 1rem;
         }
 
-        @media (max-width: 1000px) {
-            .trackers-grid { grid-template-columns: repeat(4, 1fr); }
-        }
-
-        @media (max-width: 600px) {
-            .trackers-grid { grid-template-columns: repeat(2, 1fr); }
-        }
-
         .tracker-card {
+            flex: 0 1 200px;
+            min-width: 130px;
             background: var(--bg-card);
             border: 1px solid var(--border-color);
             border-radius: var(--radius-lg);
