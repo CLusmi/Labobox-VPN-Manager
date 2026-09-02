@@ -2125,6 +2125,34 @@ bench_speed() {
     }'
 }
 
+# bench_fmt_size <octets> → « 1.0 Gio » / « 954 Mio »
+bench_fmt_size() {
+    awk -v b="$1" 'BEGIN{
+        if (b >= 1073741824) printf "%.1f Gio", b/1073741824
+        else printf "%.0f Mio", b/1048576
+    }'
+}
+
+# Sonde rapide d'une source (1 Mo, timeout court). Le préfixe « RANGE: »
+# signifie que le miroir n'a pas de petit fichier : on demande alors le
+# premier Mo du gros fichier par en-tête HTTP Range (206), vérifié honoré.
+bench_probe_direct() {
+    case "$1" in
+        RANGE:*) timeout 25 wget -4 -q -T 15 -t 1 --header="Range: bytes=0-1048575" -O /dev/null "${1#RANGE:}" 2>/dev/null ;;
+        *)       timeout 25 wget -4 -q -T 15 -t 1 -O /dev/null "$1" 2>/dev/null ;;
+    esac
+}
+
+# Même sonde mais depuis le conteneur Gluetun (wget busybox : pas de -4,
+# inutile de toute façon — le tunnel est en IPv4).
+bench_probe_tunnel() {
+    local client="$1" spec="$2"
+    case "$spec" in
+        RANGE:*) timeout 30 docker exec "gluetun-$client" wget -q -T 15 --header "Range: bytes=0-1048575" -O /dev/null "${spec#RANGE:}" 2>/dev/null ;;
+        *)       timeout 30 docker exec "gluetun-$client" wget -q -T 15 -O /dev/null "$spec" 2>/dev/null ;;
+    esac
+}
+
 cmd_bench_nfs() {
     local CLIENT="$1"
     local SIZE_MB="${2:-512}"
@@ -2158,40 +2186,47 @@ cmd_bench_nfs() {
     local bytes=$((SIZE_MB * 1024 * 1024))
     local start end
 
+    # Nettoyage GARANTI du fichier de test : à la fin de la fonction comme
+    # sur Ctrl+C en plein transfert (le signal est ré-émis après ménage).
+    trap 'rm -f "$target" 2>/dev/null; trap - RETURN INT TERM' RETURN
+    trap 'rm -f "$target" 2>/dev/null; trap - RETURN INT TERM; kill -s INT "$$"' INT TERM
+
     echo -e "  ${DIM}Partage : $(get_nas_share_name $CLIENT) — fichier de test : ${SIZE_MB} Mo${NC}"
-    echo -e "  ${DIM}(supprimé automatiquement à la fin)${NC}"
+    echo -e "  ${DIM}(supprimé automatiquement à la fin, même sur Ctrl+C)${NC}"
     echo ""
 
     # 1. Écriture DIRECTE (O_DIRECT) : débit brut NAS + réseau, sans le
     #    cache de la VM — c'est la vitesse que les disques encaissent.
-    echo -ne "  ${DIM}Écriture directe (sans cache)...${NC}"
+    echo -e "  ${DIM}1/3 Écriture directe, sans cache (progression de dd) :${NC}"
     start=$(date +%s%N)
-    if dd if=/dev/zero of="$target" bs=1M count="$SIZE_MB" oflag=direct conv=fdatasync >/dev/null 2>&1; then
+    if dd if=/dev/zero of="$target" bs=1M count="$SIZE_MB" oflag=direct conv=fdatasync status=progress >/dev/null; then
         end=$(date +%s%N)
-        echo -e "\r  ${GREEN}✔${NC} Écriture directe (sans cache) .... $(bench_speed $bytes $((end - start)))          "
+        echo -e "  ${GREEN}✔${NC} Écriture directe (sans cache) .... $(bench_speed $bytes $((end - start)))"
     else
-        echo -e "\r  ${YELLOW}⚠${NC} Écriture directe refusée (O_DIRECT non supporté ici)          "
+        echo -e "  ${YELLOW}⚠${NC} Écriture directe refusée (O_DIRECT non supporté ici)"
     fi
+    echo ""
 
     # 2. Écriture via le cache + fdatasync : le chemin réel des applis
     #    (rtorrent) — c'est ici que le writeback en bytes fait son effet.
-    echo -ne "  ${DIM}Écriture via cache (fdatasync)...${NC}"
+    echo -e "  ${DIM}2/3 Écriture via cache, fdatasync :${NC}"
     start=$(date +%s%N)
-    if dd if=/dev/zero of="$target" bs=1M count="$SIZE_MB" conv=fdatasync >/dev/null 2>&1; then
+    if dd if=/dev/zero of="$target" bs=1M count="$SIZE_MB" conv=fdatasync status=progress >/dev/null; then
         end=$(date +%s%N)
-        echo -e "\r  ${GREEN}✔${NC} Écriture via cache (fdatasync) ... $(bench_speed $bytes $((end - start)))          "
+        echo -e "  ${GREEN}✔${NC} Écriture via cache (fdatasync) ... $(bench_speed $bytes $((end - start)))"
     else
-        echo -e "\r  ${RED}✗${NC} Écriture via cache : échec          "
+        echo -e "  ${RED}✗${NC} Écriture via cache : échec"
     fi
+    echo ""
 
     # 3. Lecture directe (sans le cache local, sinon on mesure la RAM).
-    echo -ne "  ${DIM}Lecture directe...${NC}"
+    echo -e "  ${DIM}3/3 Lecture directe :${NC}"
     start=$(date +%s%N)
-    if dd if="$target" of=/dev/null bs=1M iflag=direct >/dev/null 2>&1; then
+    if dd if="$target" of=/dev/null bs=1M iflag=direct status=progress; then
         end=$(date +%s%N)
-        echo -e "\r  ${GREEN}✔${NC} Lecture directe .................. $(bench_speed $bytes $((end - start)))          "
+        echo -e "  ${GREEN}✔${NC} Lecture directe .................. $(bench_speed $bytes $((end - start)))"
     else
-        echo -e "\r  ${YELLOW}⚠${NC} Lecture directe non supportée ici (mesure sautée)          "
+        echo -e "  ${YELLOW}⚠${NC} Lecture directe non supportée ici (mesure sautée)"
     fi
 
     rm -f "$target" 2>/dev/null
@@ -2217,69 +2252,80 @@ cmd_bench_vpn() {
         return 1
     fi
 
-    # Sources de test essayées dans l'ordre : url_100mo|url_sonde_1mo|octets|nom.
+    # Sources de test (~1 Go) essayées dans l'ordre : url|sonde|octets|nom.
     # Uniquement des FICHIERS STATIQUES : les endpoints dynamiques de
     # speedtest (speed.cloudflare.com/__down) acceptent une petite sonde
     # mais coupent les gros transferts faits au wget — vérifié en réel.
-    # La sonde de 1 Mo écarte vite une source morte, puis la MESURE
-    # elle-même bascule sur la source suivante si les 100 Mo échouent en
-    # cours de route. En direct, IPv4 est forcé (-4) ; le wget busybox de
-    # Gluetun ne l'a pas, inutile dans le tunnel (IPv4 de toute façon).
+    # Tailles vérifiées par Content-Length : chez Free, « 1048576.rnd »
+    # fait en réalité 1 Gio (et il n'y a pas de petit fichier → sonde par
+    # en-tête Range sur le même fichier). La MESURE elle-même bascule sur
+    # la source suivante si le transfert casse en route. En direct, IPv4
+    # est forcé (-4) — pas dans le tunnel (busybox, et IPv4 de toute façon).
     local sources=(
-        "https://scaleway.testdebit.info/100M.iso|https://scaleway.testdebit.info/1M.iso|100000000|Scaleway"
-        "https://proof.ovh.net/files/100Mb.dat|https://proof.ovh.net/files/1Mb.dat|104857600|OVH"
-        "http://ipv4.download.thinkbroadband.com/100MB.zip|http://ipv4.download.thinkbroadband.com/1MB.zip|104857600|ThinkBroadband"
+        "http://test-debit.free.fr/1048576.rnd|RANGE:http://test-debit.free.fr/1048576.rnd|1073741824|Free"
+        "https://scaleway.testdebit.info/1G.iso|https://scaleway.testdebit.info/1M.iso|1000000000|Scaleway"
+        "http://ping.online.net/1000Mo.dat|http://ping.online.net/1Mo.dat|1000000000|Online.net"
+        "https://rbx.proof.ovh.net/files/1Gb.dat|https://rbx.proof.ovh.net/files/1Mb.dat|1073741824|OVH (RBX)"
     )
 
-    echo -e "  ${DIM}Deux passes sur la même source : en direct depuis la VM (référence),${NC}"
-    echo -e "  ${DIM}puis via le tunnel du client.${NC}"
+    echo -e "  ${DIM}Deux passes de ~1 Go sur la même source : en direct depuis la VM${NC}"
+    echo -e "  ${DIM}(référence), puis via le tunnel du client. Rien n'est écrit sur le${NC}"
+    echo -e "  ${DIM}disque : le flux part dans /dev/null.${NC}"
     echo ""
 
-    # 1. Trouver une source qui livre RÉELLEMENT 100 Mo en direct : la
-    #    sonde puis la mesure — un échec de mesure passe à la suivante.
-    local src url probe bytes lbl label="" vpn_ns="" direct_ns=""
+    # 1. Trouver une source qui livre RÉELLEMENT son fichier en direct :
+    #    la sonde puis la mesure — un échec de mesure passe à la suivante.
+    local src url probe bytes lbl label="" size_h="" vpn_ns="" direct_ns=""
     for src in "${sources[@]}"; do
         IFS='|' read -r url probe bytes lbl <<< "$src"
-        echo -ne "\r  ${DIM}Test de la source ${lbl}...${NC}                                        "
-        timeout 25 wget -4 -q -T 15 -t 1 -O /dev/null "$probe" 2>/dev/null || continue
-        echo -ne "\r  ${DIM}Mesure directe via ${lbl} (100 Mo)...${NC}                              "
+        echo -ne "\r  ${DIM}Sonde de la source ${lbl}...${NC}                                        "
+        bench_probe_direct "$probe" || continue
+        size_h=$(bench_fmt_size "$bytes")
+        echo -e "\r  ${GREEN}✔${NC} Source : ${lbl} — ${size_h} par passe                                "
+        echo ""
+        echo -e "  ${DIM}Mesure en direct depuis la VM (progression de wget) :${NC}"
         start=$(date +%s%N)
-        if timeout 300 wget -4 -q -T 60 -t 1 -O /dev/null "$url" 2>/dev/null; then
+        if timeout 900 wget -4 -q --show-progress -T 60 -t 1 -O /dev/null "$url"; then
             end=$(date +%s%N)
             direct_ns=$((end - start))
             label="$lbl"
             break
         fi
+        echo -e "  ${YELLOW}⚠${NC} Échec en cours de transfert via ${lbl} — source suivante."
+        echo ""
     done
     if [ -z "$label" ]; then
-        echo -e "\r  ${RED}✗${NC} Aucune source n'a pu livrer 100 Mo en direct depuis la VM.              "
+        echo -e "\r  ${RED}✗${NC} Aucune source n'a pu livrer son fichier en direct depuis la VM.         "
         echo ""
-        echo -e "  ${DIM}Sources tentées : Scaleway, OVH, ThinkBroadband. Diagnostic manuel :${NC}"
-        echo -e "  ${DIM}  wget -4 -O /dev/null https://scaleway.testdebit.info/100M.iso${NC}"
+        echo -e "  ${DIM}Sources tentées : Free, Scaleway, Online.net, OVH. Diagnostic manuel :${NC}"
+        echo -e "  ${DIM}  wget -4 -O /dev/null https://scaleway.testdebit.info/1G.iso${NC}"
         print_footer
         return 1
     fi
-    echo -e "\r  ${GREEN}✔${NC} En direct (sans VPN) ...... $(bench_speed $bytes $direct_ns) ${DIM}via ${label}${NC}          "
+    echo -e "  ${GREEN}✔${NC} En direct (sans VPN) ...... $(bench_speed $bytes $direct_ns) ${DIM}via ${label}${NC}"
 
     # 3. Sonde du tunnel (1 Mo) : distingue « tunnel mort » de « débit faible »
     echo -ne "  ${DIM}Sonde du tunnel de ${CLIENT}...${NC}"
-    if ! timeout 30 docker exec "gluetun-$CLIENT" wget -q -T 15 -O /dev/null "$probe" 2>/dev/null; then
+    if ! bench_probe_tunnel "$CLIENT" "$probe"; then
         echo -e "\r  ${RED}✗${NC} Le tunnel de ${CLIENT} ne joint pas ${label} (tunnel coupé ?)          "
         echo -e "  ${DIM}Vérifier : docker logs gluetun-${CLIENT}, et l'IP de sortie (Monitoring).${NC}"
         print_footer
         return 1
     fi
+    echo -e "\r  ${GREEN}✔${NC} Sonde du tunnel : OK                    "
 
-    # 4. Mesure via le tunnel
-    echo -ne "\r  ${DIM}Via le tunnel VPN (100 Mo)...${NC}          "
+    # 4. Mesure via le tunnel. « docker exec -t » alloue un pseudo-terminal :
+    #    le wget busybox de Gluetun affiche alors sa progression (avec %).
+    echo ""
+    echo -e "  ${DIM}Mesure via le tunnel de ${CLIENT} (progression de wget) :${NC}"
     start=$(date +%s%N)
-    if timeout 300 docker exec "gluetun-$CLIENT" wget -q -T 60 -O /dev/null "$url" 2>/dev/null; then
+    if timeout 900 docker exec -t "gluetun-$CLIENT" wget -T 60 -O /dev/null "$url"; then
         end=$(date +%s%N)
         vpn_ns=$((end - start))
-        echo -e "\r  ${GREEN}✔${NC} Via le tunnel VPN ......... $(bench_speed $bytes $vpn_ns)              "
+        echo -e "  ${GREEN}✔${NC} Via le tunnel VPN ......... $(bench_speed $bytes $vpn_ns)"
     else
-        echo -e "\r  ${RED}✗${NC} Mesure via le tunnel : échec en cours de transfert              "
-        echo -e "  ${DIM}La même source vient de livrer 100 Mo en direct : le transfert casse${NC}"
+        echo -e "  ${RED}✗${NC} Mesure via le tunnel : échec en cours de transfert"
+        echo -e "  ${DIM}La même source vient de livrer ${size_h} en direct : le transfert casse${NC}"
         echo -e "  ${DIM}DANS le tunnel. Réessaie ; si ça persiste → CPU du dédié, MTU côté nwm.${NC}"
     fi
 
