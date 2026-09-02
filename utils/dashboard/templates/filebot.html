@@ -1,0 +1,1332 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FileBot - LaboBox</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #07080c;
+            --bg-secondary: #0d0f14;
+            --bg-card: rgba(15, 18, 25, 0.8);
+            --bg-card-hover: rgba(20, 24, 32, 0.9);
+            --border-color: rgba(255, 255, 255, 0.06);
+            --border-highlight: rgba(255, 255, 255, 0.1);
+            --text-primary: #f0f2f5;
+            --text-secondary: #8b95a5;
+            --text-muted: #5a6270;
+            --accent-cyan: #06b6d4;
+            --accent-cyan-glow: rgba(6, 182, 212, 0.3);
+            --accent-green: #10b981;
+            --accent-green-glow: rgba(16, 185, 129, 0.3);
+            --accent-red: #ef4444;
+            --accent-red-glow: rgba(239, 68, 68, 0.3);
+            --accent-amber: #f59e0b;
+            --accent-amber-glow: rgba(245, 158, 11, 0.3);
+            --accent-purple: #8b5cf6;
+            --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
+            --shadow-md: 0 4px 20px rgba(0, 0, 0, 0.4);
+            --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.5);
+            --radius-sm: 6px;
+            --radius-md: 10px;
+            --radius-lg: 16px;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            line-height: 1.5;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: 
+                radial-gradient(ellipse at 20% 20%, rgba(6, 182, 212, 0.05) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 80%, rgba(139, 92, 246, 0.03) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        /* Header */
+        .header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+            padding: 1rem 2rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(20px);
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .back-btn {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: all 0.2s ease;
+        }
+
+        .back-btn:hover {
+            background: var(--bg-card-hover);
+            border-color: var(--border-highlight);
+            color: var(--text-primary);
+        }
+
+        .page-title {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .page-title-icon {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+            border-radius: var(--radius-md);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+            box-shadow: 0 0 20px var(--accent-cyan-glow);
+        }
+
+        .page-title h1 {
+            font-size: 1.3rem;
+            font-weight: 600;
+        }
+
+        .page-title span {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .logs-btn {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.85rem;
+            transition: all 0.2s ease;
+        }
+
+        .logs-btn:hover {
+            background: var(--bg-card-hover);
+            border-color: var(--accent-cyan);
+            color: var(--accent-cyan);
+        }
+
+        /* Main Layout */
+        .main-container {
+            display: grid;
+            grid-template-columns: 1fr 320px 1fr;
+            gap: 1.5rem;
+            padding: 1.5rem;
+            max-width: 1800px;
+            margin: 0 auto;
+        }
+
+        .panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            overflow: hidden;
+        }
+
+        .panel-header {
+            padding: 1rem 1.25rem;
+            background: rgba(0, 0, 0, 0.2);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .panel-title {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+
+        .panel-title-icon {
+            font-size: 1.1rem;
+        }
+
+        .panel-content {
+            padding: 1rem;
+            max-height: calc(100vh - 200px);
+            overflow-y: auto;
+        }
+
+        /* File Explorer */
+        .breadcrumb {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.75rem 1rem;
+            background: rgba(0, 0, 0, 0.2);
+            border-bottom: 1px solid var(--border-color);
+            font-size: 0.85rem;
+            overflow-x: auto;
+        }
+
+        .breadcrumb-item {
+            color: var(--text-secondary);
+            text-decoration: none;
+            padding: 0.25rem 0.5rem;
+            border-radius: var(--radius-sm);
+            transition: all 0.2s ease;
+            white-space: nowrap;
+        }
+
+        .breadcrumb-item:hover {
+            background: var(--bg-card-hover);
+            color: var(--accent-cyan);
+        }
+
+        .breadcrumb-separator {
+            color: var(--text-muted);
+        }
+
+        .file-list {
+            list-style: none;
+        }
+
+        .file-item {
+            display: flex;
+            align-items: center;
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .file-item:hover {
+            background: var(--bg-card-hover);
+        }
+
+        .file-item.selected {
+            background: rgba(6, 182, 212, 0.1);
+            border-left: 3px solid var(--accent-cyan);
+        }
+
+        .file-checkbox {
+            width: 18px;
+            height: 18px;
+            margin-right: 0.75rem;
+            accent-color: var(--accent-cyan);
+            cursor: pointer;
+        }
+
+        .file-icon {
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 0.75rem;
+            font-size: 1.2rem;
+        }
+
+        .file-icon.folder {
+            color: var(--accent-amber);
+        }
+
+        .file-icon.video {
+            color: var(--accent-cyan);
+        }
+
+        .file-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .file-name {
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .file-meta {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            display: flex;
+            gap: 1rem;
+        }
+
+        .file-actions-bar {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.75rem 1rem;
+            background: rgba(0, 0, 0, 0.2);
+            border-top: 1px solid var(--border-color);
+        }
+
+        .select-all-btn, .deselect-all-btn {
+            padding: 0.4rem 0.75rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-sm);
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .select-all-btn:hover, .deselect-all-btn:hover {
+            background: var(--bg-card-hover);
+            color: var(--text-primary);
+        }
+
+        .selection-count {
+            margin-left: auto;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        .selection-count strong {
+            color: var(--accent-cyan);
+        }
+
+        /* Options Panel */
+        .options-group {
+            margin-bottom: 1.25rem;
+        }
+
+        .options-group-title {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 0.75rem;
+        }
+
+        .option-item {
+            margin-bottom: 0.75rem;
+        }
+
+        .option-label {
+            display: block;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.35rem;
+        }
+
+        .option-select, .option-input {
+            width: 100%;
+            padding: 0.6rem 0.75rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 0.9rem;
+            transition: all 0.2s ease;
+        }
+
+        .option-select:focus, .option-input:focus {
+            outline: none;
+            border-color: var(--accent-cyan);
+            box-shadow: 0 0 0 2px var(--accent-cyan-glow);
+        }
+
+        .option-checkbox-wrapper {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0;
+        }
+
+        .option-checkbox {
+            width: 18px;
+            height: 18px;
+            accent-color: var(--accent-cyan);
+        }
+
+        .option-checkbox-label {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .action-buttons {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            margin-top: 1.5rem;
+        }
+
+        .btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            padding: 0.75rem 1rem;
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            font-family: inherit;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .btn:hover:not(:disabled) {
+            background: var(--bg-card-hover);
+            border-color: var(--border-highlight);
+            color: var(--text-primary);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+            border: none;
+            color: #000;
+            font-weight: 600;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: linear-gradient(135deg, #0891b2, #7c3aed);
+            color: #fff;
+        }
+
+        .btn-success {
+            background: var(--accent-green);
+            border-color: var(--accent-green);
+            color: #000;
+            font-weight: 600;
+        }
+
+        .btn-success:hover:not(:disabled) {
+            background: #059669;
+            border-color: #059669;
+            color: #fff;
+        }
+
+        /* Preview Panel */
+        .preview-list {
+            list-style: none;
+        }
+
+        .preview-item {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .preview-item:last-child {
+            border-bottom: none;
+        }
+
+        .preview-item.success {
+            border-left: 3px solid var(--accent-green);
+        }
+
+        .preview-item.error {
+            border-left: 3px solid var(--accent-red);
+        }
+
+        .preview-item.unmatched {
+            border-left: 3px solid var(--accent-amber);
+        }
+
+        .preview-source {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 0.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .preview-destination {
+            font-weight: 500;
+            color: var(--text-primary);
+            word-break: break-all;
+        }
+
+        .preview-type-badge {
+            display: inline-block;
+            padding: 0.15rem 0.5rem;
+            border-radius: var(--radius-sm);
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .preview-type-badge.movie {
+            background: rgba(6, 182, 212, 0.2);
+            color: var(--accent-cyan);
+        }
+
+        .preview-type-badge.series {
+            background: rgba(139, 92, 246, 0.2);
+            color: var(--accent-purple);
+        }
+
+        .preview-type-select {
+            padding: 0.25rem 0.5rem;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            font-size: 0.8rem;
+            margin-left: 0.5rem;
+        }
+
+        .preview-error {
+            color: var(--accent-red);
+            font-size: 0.85rem;
+            margin-top: 0.25rem;
+        }
+
+        .preview-summary {
+            padding: 1rem;
+            background: rgba(0, 0, 0, 0.2);
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-around;
+            text-align: center;
+        }
+
+        .summary-item {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .summary-value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .summary-value.success {
+            color: var(--accent-green);
+        }
+
+        .summary-value.error {
+            color: var(--accent-red);
+        }
+
+        .summary-value.pending {
+            color: var(--accent-amber);
+        }
+
+        .summary-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+        }
+
+        /* Loading State */
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(7, 8, 12, 0.9);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            display: none;
+        }
+
+        .loading-overlay.active {
+            display: flex;
+        }
+
+        .loading-spinner {
+            width: 60px;
+            height: 60px;
+            border: 4px solid var(--border-color);
+            border-top-color: var(--accent-cyan);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .loading-text {
+            margin-top: 1.5rem;
+            font-size: 1.1rem;
+            color: var(--text-secondary);
+        }
+
+        .loading-progress {
+            margin-top: 0.75rem;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--accent-cyan);
+        }
+
+        /* Notifications */
+        .notification {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            padding: 1rem 1.5rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            box-shadow: var(--shadow-lg);
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            z-index: 1001;
+            transform: translateX(150%);
+            transition: transform 0.3s ease;
+        }
+
+        .notification.show {
+            transform: translateX(0);
+        }
+
+        .notification.success {
+            border-color: var(--accent-green);
+        }
+
+        .notification.error {
+            border-color: var(--accent-red);
+        }
+
+        .notification-icon {
+            font-size: 1.25rem;
+        }
+
+        .notification.success .notification-icon {
+            color: var(--accent-green);
+        }
+
+        .notification.error .notification-icon {
+            color: var(--accent-red);
+        }
+
+        /* Empty State */
+        .empty-state {
+            text-align: center;
+            padding: 3rem 1rem;
+            color: var(--text-muted);
+        }
+
+        .empty-state-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+
+        .empty-state-text {
+            font-size: 0.95rem;
+        }
+
+        /* Responsive */
+        @media (max-width: 1200px) {
+            .main-container {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="header-left">
+            <a href="/" class="back-btn">
+                ← Retour au Dashboard
+            </a>
+            <div class="page-title">
+                <div class="page-title-icon">📁</div>
+                <div>
+                    <h1>FileBot</h1>
+                    <span>Organiser vos fichiers médias</span>
+                </div>
+            </div>
+        </div>
+        <div class="header-right">
+            <a href="/filebot/logs" class="logs-btn">
+                📋 Historique
+            </a>
+        </div>
+    </header>
+
+    <main class="main-container">
+        <!-- Panel Explorateur -->
+        <div class="panel" id="explorer-panel">
+            <div class="panel-header">
+                <div class="panel-title">
+                    <span class="panel-title-icon">📂</span>
+                    Sélectionner les fichiers
+                </div>
+            </div>
+            <div class="breadcrumb" id="breadcrumb">
+                <a href="#" class="breadcrumb-item" data-path="">data</a>
+            </div>
+            <div class="panel-content" id="file-list-container">
+                <ul class="file-list" id="file-list">
+                    <!-- Files will be populated here -->
+                </ul>
+            </div>
+            <div class="file-actions-bar">
+                <button class="select-all-btn" onclick="selectAll()">✓ Tout sélectionner</button>
+                <button class="deselect-all-btn" onclick="deselectAll()">✗ Désélectionner</button>
+                <div class="selection-count">
+                    <strong id="selected-count">0</strong> fichier(s) sélectionné(s)
+                </div>
+            </div>
+        </div>
+
+        <!-- Panel Options -->
+        <div class="panel" id="options-panel">
+            <div class="panel-header">
+                <div class="panel-title">
+                    <span class="panel-title-icon">⚙️</span>
+                    Options
+                </div>
+            </div>
+            <div class="panel-content">
+                <div class="options-group">
+                    <div class="options-group-title">Action</div>
+                    <div class="option-item">
+                        <select class="option-select" id="action-select">
+                            <option value="copy">📋 Copier et renommer</option>
+                            <option value="move">✂️ Déplacer et renommer</option>
+                            <option value="rename">✏️ Renommer sur place</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="options-group">
+                    <div class="options-group-title">Destinations</div>
+                    <div class="option-item">
+                        <label class="option-label">Films</label>
+                        <input type="text" class="option-input" id="dest-movies" value="/data/filebot/films" disabled placeholder="films_filebot">
+                    </div>
+                    <div class="option-item">
+                        <label class="option-label">Séries</label>
+                        <input type="text" class="option-input" id="dest-series" value="/data/filebot/series" disabled placeholder="series_filebot">
+                    </div>
+                </div>
+
+                <div class="options-group">
+                    <div class="options-group-title">Détection</div>
+                    <div class="option-item">
+                        <select class="option-select" id="media-type-select">
+                            <option value="auto">🎯 Auto-détection</option>
+                            <option value="movie">🎬 Films uniquement</option>
+                            <option value="series">📺 Séries uniquement</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="options-group">
+                    <div class="options-group-title">En cas de conflit</div>
+                    <div class="option-item">
+                        <select class="option-select" id="conflict-select">
+                            <option value="skip">⏭️ Ignorer (garder l'existant)</option>
+                            <option value="override">🔄 Écraser</option>
+                            <option value="auto">🤖 Renommer automatiquement</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="options-group">
+                    <div class="options-group-title">Options avancées</div>
+                    <div class="option-checkbox-wrapper">
+                        <input type="checkbox" class="option-checkbox" id="subtitles-checkbox">
+                        <label class="option-checkbox-label" for="subtitles-checkbox">
+                            🇫🇷 Télécharger sous-titres FR
+                        </label>
+                    </div>
+                    <div class="option-checkbox-wrapper">
+                        <input type="checkbox" class="option-checkbox" id="dryrun-checkbox" checked>
+                        <label class="option-checkbox-label" for="dryrun-checkbox">
+                            👁️ Prévisualiser avant traitement
+                        </label>
+                    </div>
+                </div>
+
+                <div class="action-buttons">
+                    <button class="btn btn-primary" id="preview-btn" onclick="runPreview()" disabled>
+                        👁️ Prévisualiser
+                    </button>
+                    <button class="btn btn-success" id="process-btn" onclick="runProcess()" disabled>
+                        ✨ Traiter les fichiers
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Panel Aperçu/Résultats -->
+        <div class="panel" id="preview-panel">
+            <div class="panel-header">
+                <div class="panel-title">
+                    <span class="panel-title-icon">📋</span>
+                    <span id="preview-title">Aperçu</span>
+                </div>
+            </div>
+            <div class="panel-content" id="preview-content">
+                <div class="empty-state">
+                    <div class="empty-state-icon">🎬</div>
+                    <p class="empty-state-text">
+                        Sélectionnez des fichiers puis cliquez sur "Prévisualiser"<br>
+                        pour voir comment ils seront renommés
+                    </p>
+                </div>
+            </div>
+            <div class="preview-summary" id="preview-summary" style="display: none;">
+                <div class="summary-item">
+                    <span class="summary-value success" id="summary-success">0</span>
+                    <span class="summary-label">Reconnus</span>
+                </div>
+                <div class="summary-item">
+                    <span class="summary-value error" id="summary-errors">0</span>
+                    <span class="summary-label">Erreurs</span>
+                </div>
+                <div class="summary-item">
+                    <span class="summary-value pending" id="summary-pending">0</span>
+                    <span class="summary-label">En attente</span>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loading-overlay">
+        <div class="loading-spinner"></div>
+        <div class="loading-text" id="loading-text">Chargement...</div>
+        <div class="loading-progress" id="loading-progress"></div>
+    </div>
+
+    <!-- Notification -->
+    <div class="notification" id="notification">
+        <span class="notification-icon" id="notification-icon">✓</span>
+        <span class="notification-text" id="notification-text"></span>
+    </div>
+
+    <script>
+        // Configuration
+        const CLIENT_NAME = '{{.ClientName}}';
+        let currentPath = '';
+        let selectedFiles = new Set();
+        let previewResults = [];
+        let isProcessing = false;
+
+        // Initialisation
+        document.addEventListener('DOMContentLoaded', () => {
+            loadDirectory('');
+        });
+
+        // Charger un répertoire
+        async function loadDirectory(path) {
+            showLoading('Chargement du répertoire...');
+            
+            try {
+                const response = await fetch('/api/filebot/browse', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ client: CLIENT_NAME, path: path || null })
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    showNotification(data.error, 'error');
+                    hideLoading();
+                    return;
+                }
+                
+                currentPath = data.current_path;
+                renderBreadcrumb(data);
+                renderFileList(data);
+                
+            } catch (error) {
+                showNotification('Erreur de connexion', 'error');
+                console.error(error);
+            }
+            
+            hideLoading();
+        }
+
+        // Afficher le breadcrumb
+        function renderBreadcrumb(data) {
+            const container = document.getElementById('breadcrumb');
+            const parts = data.relative_path.split('/').filter(p => p);
+            
+            let html = '<a href="#" class="breadcrumb-item" onclick="loadDirectory(\'\'); return false;">data</a>';
+            let path = '';
+            
+            for (const part of parts) {
+                path += '/' + part;
+                html += '<span class="breadcrumb-separator">/</span>';
+                html += `<a href="#" class="breadcrumb-item" onclick="loadDirectory('${data.current_path.replace(/'/g, "\\'")}'); return false;">${part}</a>`;
+            }
+            
+            container.innerHTML = html;
+        }
+
+        // Afficher la liste des fichiers
+        function renderFileList(data) {
+            const container = document.getElementById('file-list');
+            let html = '';
+            
+            // Bouton retour si possible
+            if (data.can_go_up) {
+                html += `
+                    <li class="file-item" onclick="loadDirectory('${data.parent_path.replace(/'/g, "\\'")}')">
+                        <div class="file-icon folder">📁</div>
+                        <div class="file-info">
+                            <div class="file-name">..</div>
+                            <div class="file-meta">Dossier parent</div>
+                        </div>
+                    </li>
+                `;
+            }
+            
+            // Fichiers et dossiers
+            for (const item of data.items) {
+                if (item.is_dir) {
+                    html += `
+                        <li class="file-item" onclick="loadDirectory('${item.path.replace(/'/g, "\\'")}')">
+                            <input type="checkbox" class="file-checkbox" 
+                                   onclick="event.stopPropagation(); toggleFolderSelection('${item.path.replace(/'/g, "\\'")}', this.checked)">
+                            <div class="file-icon folder">📁</div>
+                            <div class="file-info">
+                                <div class="file-name">${escapeHtml(item.name)}</div>
+                                <div class="file-meta">
+                                    <span>${item.file_count} élément(s)</span>
+                                </div>
+                            </div>
+                        </li>
+                    `;
+                } else if (item.is_video) {
+                    const isSelected = selectedFiles.has(item.path);
+                    html += `
+                        <li class="file-item ${isSelected ? 'selected' : ''}" data-path="${escapeHtml(item.path)}"
+                            onclick="toggleFileSelection('${item.path.replace(/'/g, "\\'")}')">
+                            <input type="checkbox" class="file-checkbox" ${isSelected ? 'checked' : ''}
+                                   onclick="event.stopPropagation(); toggleFileSelection('${item.path.replace(/'/g, "\\'")}')">
+                            <div class="file-icon video">🎬</div>
+                            <div class="file-info">
+                                <div class="file-name">${escapeHtml(item.name)}</div>
+                                <div class="file-meta">
+                                    <span>${item.size_formatted}</span>
+                                    <span>${item.modified}</span>
+                                </div>
+                            </div>
+                        </li>
+                    `;
+                } else {
+                    html += `
+                        <li class="file-item" style="opacity: 0.5;">
+                            <div class="file-icon">📄</div>
+                            <div class="file-info">
+                                <div class="file-name">${escapeHtml(item.name)}</div>
+                                <div class="file-meta">
+                                    <span>${item.size_formatted}</span>
+                                </div>
+                            </div>
+                        </li>
+                    `;
+                }
+            }
+            
+            if (data.items.length === 0) {
+                html = `
+                    <li class="empty-state">
+                        <div class="empty-state-icon">📭</div>
+                        <p class="empty-state-text">Ce dossier est vide</p>
+                    </li>
+                `;
+            }
+            
+            container.innerHTML = html;
+            updateSelectionCount();
+        }
+
+        // Sélection de fichier
+        function toggleFileSelection(path) {
+            if (selectedFiles.has(path)) {
+                selectedFiles.delete(path);
+            } else {
+                selectedFiles.add(path);
+            }
+            updateSelectionUI();
+        }
+
+        // Sélection de dossier (récursif)
+        async function toggleFolderSelection(path, selected) {
+            showLoading('Scan du dossier...');
+            
+            try {
+                const response = await fetch('/api/filebot/scan', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ client: CLIENT_NAME, paths: [path] })
+                });
+                
+                const data = await response.json();
+                
+                if (data.files) {
+                    for (const file of data.files) {
+                        if (file.valid) {
+                            if (selected) {
+                                selectedFiles.add(file.path);
+                            } else {
+                                selectedFiles.delete(file.path);
+                            }
+                        }
+                    }
+                    updateSelectionUI();
+                }
+                
+            } catch (error) {
+                showNotification('Erreur lors du scan', 'error');
+            }
+            
+            hideLoading();
+        }
+
+        // Tout sélectionner
+        function selectAll() {
+            document.querySelectorAll('.file-item[data-path]').forEach(item => {
+                const path = item.dataset.path;
+                if (path) selectedFiles.add(path);
+            });
+            updateSelectionUI();
+        }
+
+        // Tout désélectionner
+        function deselectAll() {
+            selectedFiles.clear();
+            updateSelectionUI();
+        }
+
+        // Mettre à jour l'UI de sélection
+        function updateSelectionUI() {
+            document.querySelectorAll('.file-item[data-path]').forEach(item => {
+                const path = item.dataset.path;
+                const checkbox = item.querySelector('.file-checkbox');
+                const isSelected = selectedFiles.has(path);
+                
+                item.classList.toggle('selected', isSelected);
+                if (checkbox) checkbox.checked = isSelected;
+            });
+            
+            updateSelectionCount();
+        }
+
+        // Mettre à jour le compteur
+        function updateSelectionCount() {
+            const count = selectedFiles.size;
+            document.getElementById('selected-count').textContent = count;
+            document.getElementById('preview-btn').disabled = count === 0;
+            document.getElementById('process-btn').disabled = count === 0 || previewResults.length === 0;
+        }
+
+        // Prévisualiser
+        async function runPreview() {
+            if (selectedFiles.size === 0) return;
+            
+            showLoading('Analyse des fichiers...');
+            
+            const files = Array.from(selectedFiles).map(path => ({ path }));
+            const mediaType = document.getElementById('media-type-select').value;
+            const subtitles = document.getElementById('subtitles-checkbox').checked ? 'fr' : null;
+            
+            try {
+                const response = await fetch('/api/filebot/preview', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        client: CLIENT_NAME,
+                        files: files,
+                        media_type: mediaType,
+                        subtitles_lang: subtitles
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    showNotification(data.error, 'error');
+                } else {
+                    previewResults = data.results;
+                    renderPreview(data);
+                    showNotification(`${data.matched} fichier(s) reconnu(s)`, 'success');
+                }
+                
+            } catch (error) {
+                showNotification('Erreur lors de la prévisualisation', 'error');
+                console.error(error);
+            }
+            
+            hideLoading();
+        }
+
+        // Afficher l'aperçu
+        function renderPreview(data) {
+            const container = document.getElementById('preview-content');
+            const summary = document.getElementById('preview-summary');
+            
+            let html = '<ul class="preview-list">';
+            
+            for (let i = 0; i < data.results.length; i++) {
+                const result = data.results[i];
+                const statusClass = result.matched ? 'success' : (result.status === 'error' ? 'error' : 'unmatched');
+                
+                html += `
+                    <li class="preview-item ${statusClass}">
+                        <div class="preview-source">
+                            📄 ${escapeHtml(result.source_name)}
+                            ${result.detected_type ? `
+                                <select class="preview-type-select" onchange="updatePreviewType(${i}, this.value)">
+                                    <option value="auto" ${result.detected_type === 'auto' ? 'selected' : ''}>Auto</option>
+                                    <option value="movie" ${result.detected_type === 'movie' ? 'selected' : ''}>🎬 Film</option>
+                                    <option value="series" ${result.detected_type === 'series' ? 'selected' : ''}>📺 Série</option>
+                                </select>
+                            ` : ''}
+                        </div>
+                        ${result.destination_name ? `
+                            <div class="preview-destination">
+                                → ${escapeHtml(result.destination_name)}
+                            </div>
+                        ` : `
+                            <div class="preview-error">
+                                ⚠️ ${result.error || 'Non reconnu'}
+                            </div>
+                        `}
+                    </li>
+                `;
+            }
+            
+            html += '</ul>';
+            container.innerHTML = html;
+            
+            // Mettre à jour le résumé
+            const matched = data.results.filter(r => r.matched).length;
+            const errors = data.results.filter(r => !r.matched).length;
+            
+            document.getElementById('summary-success').textContent = matched;
+            document.getElementById('summary-errors').textContent = errors;
+            document.getElementById('summary-pending').textContent = selectedFiles.size - data.results.length;
+            summary.style.display = 'flex';
+            
+            document.getElementById('process-btn').disabled = matched === 0;
+        }
+
+        // Mettre à jour le type dans l'aperçu
+        function updatePreviewType(index, type) {
+            if (previewResults[index]) {
+                previewResults[index].forced_type = type;
+            }
+        }
+
+        // Traiter les fichiers
+        async function runProcess() {
+            if (isProcessing) return;
+            
+            const dryRun = document.getElementById('dryrun-checkbox').checked;
+            
+            // Si dry-run activé et pas de preview, faire d'abord un preview
+            if (dryRun && previewResults.length === 0) {
+                await runPreview();
+                if (previewResults.length === 0) return;
+            }
+            
+            // Confirmation
+            const matched = previewResults.filter(r => r.matched).length;
+            if (matched === 0) {
+                showNotification('Aucun fichier reconnu à traiter', 'error');
+                return;
+            }
+            
+            if (!confirm(`Traiter ${matched} fichier(s) ?\n\nCette action va ${document.getElementById('action-select').value === 'move' ? 'déplacer' : document.getElementById('action-select').value === 'copy' ? 'copier' : 'renommer'} les fichiers.`)) {
+                return;
+            }
+            
+            isProcessing = true;
+            showLoading('Traitement en cours...', true);
+            
+            const action = document.getElementById('action-select').value;
+            const destMovies = document.getElementById('dest-movies').value;
+            const destSeries = document.getElementById('dest-series').value;
+            const conflict = document.getElementById('conflict-select').value;
+            const subtitles = document.getElementById('subtitles-checkbox').checked ? 'fr' : null;
+            
+            // Préparer les fichiers avec leurs types forcés
+            const files = previewResults
+                .filter(r => r.matched)
+                .map(r => ({
+                    path: r.source,
+                    forced_type: r.forced_type || r.detected_type || 'auto'
+                }));
+            
+            try {
+                const response = await fetch('/api/filebot/rename', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        client: CLIENT_NAME,
+                        files: files,
+                        destination_movies: destMovies,
+                        destination_series: destSeries,
+                        action: action,
+                        conflict: conflict,
+                        subtitles_lang: subtitles,
+                        async: false
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    showNotification(data.error, 'error');
+                } else {
+                    renderResults(data);
+                    showNotification(`${data.success} fichier(s) traité(s) avec succès`, 'success');
+                    
+                    // Nettoyer la sélection des fichiers traités avec succès
+                    for (const result of data.results) {
+                        if (result.status === 'success') {
+                            selectedFiles.delete(result.source);
+                        }
+                    }
+                    updateSelectionUI();
+                }
+                
+            } catch (error) {
+                showNotification('Erreur lors du traitement', 'error');
+                console.error(error);
+            }
+            
+            isProcessing = false;
+            hideLoading();
+        }
+
+        // Afficher les résultats
+        function renderResults(data) {
+            const container = document.getElementById('preview-content');
+            document.getElementById('preview-title').textContent = 'Résultats';
+            
+            let html = '<ul class="preview-list">';
+            
+            for (const result of data.results) {
+                const statusClass = result.status === 'success' ? 'success' : (result.status === 'skipped' ? 'unmatched' : 'error');
+                const icon = result.status === 'success' ? '✓' : (result.status === 'skipped' ? '⏭️' : '✗');
+                
+                html += `
+                    <li class="preview-item ${statusClass}">
+                        <div class="preview-source">
+                            ${icon} ${escapeHtml(result.source ? result.source.split('/').pop() : 'Fichier')}
+                        </div>
+                        ${result.destination ? `
+                            <div class="preview-destination">
+                                → ${escapeHtml(result.destination.split('/').pop())}
+                            </div>
+                        ` : result.reason || result.error ? `
+                            <div class="preview-error">
+                                ${result.reason || result.error}
+                            </div>
+                        ` : ''}
+                    </li>
+                `;
+            }
+            
+            html += '</ul>';
+            container.innerHTML = html;
+            
+            // Mettre à jour le résumé
+            document.getElementById('summary-success').textContent = data.success || 0;
+            document.getElementById('summary-errors').textContent = data.errors || 0;
+            document.getElementById('summary-pending').textContent = 0;
+            
+            previewResults = [];
+        }
+
+        // Utilitaires
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function showLoading(text, showProgress = false) {
+            document.getElementById('loading-text').textContent = text;
+            document.getElementById('loading-progress').textContent = showProgress ? '0%' : '';
+            document.getElementById('loading-overlay').classList.add('active');
+        }
+
+        function hideLoading() {
+            document.getElementById('loading-overlay').classList.remove('active');
+        }
+
+        function showNotification(text, type = 'success') {
+            const notification = document.getElementById('notification');
+            const icon = document.getElementById('notification-icon');
+            const textEl = document.getElementById('notification-text');
+            
+            notification.className = 'notification ' + type;
+            icon.textContent = type === 'success' ? '✓' : '✗';
+            textEl.textContent = text;
+            
+            notification.classList.add('show');
+            
+            setTimeout(() => {
+                notification.classList.remove('show');
+            }, 4000);
+        }
+    </script>
+</body>
+</html>

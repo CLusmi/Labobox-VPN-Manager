@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FileBot - Historique - LaboBox</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #07080c;
+            --bg-secondary: #0d0f14;
+            --bg-card: rgba(15, 18, 25, 0.8);
+            --bg-card-hover: rgba(20, 24, 32, 0.9);
+            --border-color: rgba(255, 255, 255, 0.06);
+            --border-highlight: rgba(255, 255, 255, 0.1);
+            --text-primary: #f0f2f5;
+            --text-secondary: #8b95a5;
+            --text-muted: #5a6270;
+            --accent-cyan: #06b6d4;
+            --accent-cyan-glow: rgba(6, 182, 212, 0.3);
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-amber: #f59e0b;
+            --accent-purple: #8b5cf6;
+            --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.5);
+            --radius-sm: 6px;
+            --radius-md: 10px;
+            --radius-lg: 16px;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            line-height: 1.5;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: 
+                radial-gradient(ellipse at 20% 20%, rgba(6, 182, 212, 0.05) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 80%, rgba(139, 92, 246, 0.03) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        .header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+            padding: 1rem 2rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(20px);
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .back-btn {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: all 0.2s ease;
+        }
+
+        .back-btn:hover {
+            background: var(--bg-card-hover);
+            border-color: var(--border-highlight);
+            color: var(--text-primary);
+        }
+
+        .page-title {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .page-title-icon {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+            border-radius: var(--radius-md);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+            box-shadow: 0 0 20px var(--accent-cyan-glow);
+        }
+
+        .page-title h1 { font-size: 1.3rem; font-weight: 600; }
+        .page-title span { font-size: 0.85rem; color: var(--text-muted); }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+            display: grid;
+            grid-template-columns: 350px 1fr;
+            gap: 1.5rem;
+        }
+
+        .panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            overflow: hidden;
+        }
+
+        .panel-header {
+            padding: 1rem 1.25rem;
+            background: rgba(0, 0, 0, 0.2);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .panel-title {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+
+        .panel-content {
+            padding: 0;
+            max-height: calc(100vh - 200px);
+            overflow-y: auto;
+        }
+
+        .log-list { list-style: none; }
+
+        .log-item {
+            display: flex;
+            align-items: center;
+            padding: 1rem 1.25rem;
+            border-bottom: 1px solid var(--border-color);
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .log-item:hover { background: var(--bg-card-hover); }
+
+        .log-item.active {
+            background: rgba(6, 182, 212, 0.1);
+            border-left: 3px solid var(--accent-cyan);
+        }
+
+        .log-icon {
+            width: 40px;
+            height: 40px;
+            background: var(--bg-secondary);
+            border-radius: var(--radius-sm);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 1rem;
+            font-size: 1.1rem;
+        }
+
+        .log-info { flex: 1; }
+
+        .log-date {
+            font-weight: 500;
+            margin-bottom: 0.25rem;
+        }
+
+        .log-stats {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            display: flex;
+            gap: 0.75rem;
+        }
+
+        .log-stat {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        .log-stat.success { color: var(--accent-green); }
+        .log-stat.error { color: var(--accent-red); }
+        .log-stat.skipped { color: var(--accent-amber); }
+
+        .log-content {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-all;
+            padding: 1.25rem;
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+            min-height: 400px;
+        }
+
+        .log-content .success { color: var(--accent-green); }
+        .log-content .error { color: var(--accent-red); }
+        .log-content .info { color: var(--accent-cyan); }
+        .log-content .warning { color: var(--accent-amber); }
+
+        .empty-state {
+            text-align: center;
+            padding: 3rem 1rem;
+            color: var(--text-muted);
+        }
+
+        .empty-state-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+
+        @media (max-width: 900px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="header-left">
+            <a href="/filebot" class="back-btn">← Retour à FileBot</a>
+            <div class="page-title">
+                <div class="page-title-icon">📋</div>
+                <div>
+                    <h1>Historique FileBot</h1>
+                    <span>Logs des opérations</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="container">
+        <div class="panel">
+            <div class="panel-header">
+                <div class="panel-title">
+                    <span>📅</span> Opérations récentes
+                </div>
+            </div>
+            <div class="panel-content">
+                <ul class="log-list" id="log-list">
+                    <!-- Logs will be populated here -->
+                </ul>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">
+                <div class="panel-title">
+                    <span>📄</span> <span id="log-title">Détails du log</span>
+                </div>
+            </div>
+            <div class="panel-content">
+                <div class="log-content" id="log-content">
+                    <div class="empty-state">
+                        <div class="empty-state-icon">📋</div>
+                        <p>Sélectionnez un log pour voir son contenu</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        const CLIENT_NAME = '{{.ClientName}}';
+        let currentLog = null;
+
+        document.addEventListener('DOMContentLoaded', () => {
+            loadLogs();
+        });
+
+        async function loadLogs() {
+            try {
+                const response = await fetch('/api/filebot/logs', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ client: CLIENT_NAME, limit: 50 })
+                });
+                
+                const data = await response.json();
+                
+                if (data.logs && data.logs.length > 0) {
+                    renderLogList(data.logs);
+                } else {
+                    document.getElementById('log-list').innerHTML = `
+                        <li class="empty-state">
+                            <div class="empty-state-icon">📭</div>
+                            <p>Aucun log disponible</p>
+                        </li>
+                    `;
+                }
+            } catch (error) {
+                console.error('Error loading logs:', error);
+            }
+        }
+
+        function renderLogList(logs) {
+            const container = document.getElementById('log-list');
+            let html = '';
+            
+            for (const log of logs) {
+                html += `
+                    <li class="log-item" data-filename="${log.filename}" onclick="loadLogContent('${log.filename}')">
+                        <div class="log-icon">📄</div>
+                        <div class="log-info">
+                            <div class="log-date">${log.date}</div>
+                            <div class="log-stats">
+                                <span class="log-stat success">✓ ${log.success}</span>
+                                <span class="log-stat error">✗ ${log.errors}</span>
+                                <span class="log-stat skipped">⏭ ${log.skipped}</span>
+                            </div>
+                        </div>
+                    </li>
+                `;
+            }
+            
+            container.innerHTML = html;
+        }
+
+        async function loadLogContent(filename) {
+            // Update active state
+            document.querySelectorAll('.log-item').forEach(item => {
+                item.classList.toggle('active', item.dataset.filename === filename);
+            });
+            
+            currentLog = filename;
+            document.getElementById('log-title').textContent = filename;
+            
+            try {
+                const response = await fetch('/api/filebot/logs/content', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ client: CLIENT_NAME, filename: filename })
+                });
+                
+                const data = await response.json();
+                
+                if (data.content) {
+                    // Colorize the content
+                    let content = escapeHtml(data.content);
+                    content = content.replace(/(SUCCESS:.*)/g, '<span class="success">$1</span>');
+                    content = content.replace(/(ERROR:.*)/g, '<span class="error">$1</span>');
+                    content = content.replace(/(UNMATCHED:.*)/g, '<span class="warning">$1</span>');
+                    content = content.replace(/(SKIPPED:.*)/g, '<span class="warning">$1</span>');
+                    content = content.replace(/(Processing:.*)/g, '<span class="info">$1</span>');
+                    content = content.replace(/(===.*===)/g, '<span class="info">$1</span>');
+                    
+                    document.getElementById('log-content').innerHTML = content;
+                } else if (data.error) {
+                    document.getElementById('log-content').innerHTML = `<span class="error">Erreur: ${data.error}</span>`;
+                }
+            } catch (error) {
+                console.error('Error loading log content:', error);
+                document.getElementById('log-content').innerHTML = '<span class="error">Erreur de chargement</span>';
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+    </script>
+</body>
+</html>
