@@ -122,29 +122,40 @@ if [ "$CURRENT_NOFILE" != "unlimited" ] && [ "$CURRENT_NOFILE" -lt "$NEEDED" ]; 
 fi
 
 ###########################################
-# EMPLACEMENT SESSION + LOGS (hors NFS)
+# EMPLACEMENT SESSION + LOGS
 ###########################################
 # rtorrent est MONOTHREAD : toute operation disque bloquante gele le client
 # entier, downloads compris. La sauvegarde de session reecrit un fichier par
 # torrent modifie ; sur NFS avec plusieurs centaines de torrents, c'est
 # plusieurs secondes de gel a chaque cycle.
 #
-# Si un volume local est monte sur /local, on y place la session et les logs.
-# Sinon on retombe sur /config (NFS) avec un avertissement.
-#
-# Cote manager, ajouter au docker run :
-#     -v laboboxvpn-session-${CLIENT}:/local
-# (volume nomme Docker : persiste a la recreation du conteneur)
+# Par defaut, si un volume local est monte sur /local, session et logs y
+# vivent. RT_SESSION_NFS=yes (env du compose, commande session-nas du
+# manager) force la session sur le NAS (/config/rtorrent/.session) : elle
+# survit alors a la perte de la VM. Les logs, sans valeur pour les seeds,
+# restent sur /local quand il est disponible.
 
 echo "> Emplacement de la session rtorrent..."
 
+RT_SESSION_NFS="${RT_SESSION_NFS:-no}"
+
 if grep -q " /local " /proc/mounts 2>/dev/null; then
-    SESSION_PATH="/local/session"
+    LOCAL_MOUNTED="yes"
     LOG_PATH="/local/log"
+else
+    LOCAL_MOUNTED="no"
+    LOG_PATH="/config/rtorrent/log"
+fi
+
+if [ "$RT_SESSION_NFS" = "yes" ]; then
+    SESSION_PATH="/config/rtorrent/.session"
+    echo "  [OK] RT_SESSION_NFS=yes -> session sur le NAS (survit a la perte de la VM)"
+    [ "$LOCAL_MOUNTED" = "yes" ] && echo "       logs sur le volume local"
+elif [ "$LOCAL_MOUNTED" = "yes" ]; then
+    SESSION_PATH="/local/session"
     echo "  [OK] Volume local detecte -> session et logs hors NFS"
 else
     SESSION_PATH="/config/rtorrent/.session"
-    LOG_PATH="/config/rtorrent/log"
     echo "  [!] Pas de volume monte sur /local : session et logs restent sur NFS."
     echo "      C'est la premiere cause de ralentissement avec beaucoup de torrents."
 fi
@@ -152,7 +163,7 @@ fi
 mkdir -p "$SESSION_PATH"
 mkdir -p "$LOG_PATH"
 
-# Migration one-shot : si on vient de basculer vers /local et que l'ancienne
+# Migration one-shot vers /local : si on vient de basculer et que l'ancienne
 # session NFS contient des donnees, on les recupere (sinon tous les torrents
 # disparaissent de l'interface).
 if [ "$SESSION_PATH" = "/local/session" ]; then
@@ -162,6 +173,28 @@ if [ "$SESSION_PATH" = "/local/session" ]; then
         cp -a /config/rtorrent/.session/. "$SESSION_PATH"/ 2>/dev/null || true
         echo "     [OK] $(ls -1 "$SESSION_PATH" | wc -l) fichiers migres"
     fi
+fi
+
+# Migration one-shot retour vers le NAS : la session VIVANTE est celle de
+# /local/session ; l'ancienne session NFS (laissee en place par la migration
+# aller) est PERIMEE et ne doit jamais etre rechargee telle quelle — elle
+# ressusciterait une vieille liste de torrents. On l'ecarte, on copie la
+# session vivante, puis on ecarte la copie locale pour ne pas re-declencher.
+# Rien n'est supprime : tout reste en sauvegarde horodatee.
+if [ "$SESSION_PATH" = "/config/rtorrent/.session" ] && \
+   [ -n "$(ls -A /local/session 2>/dev/null)" ]; then
+    STAMP=$(date +%Y%m%d%H%M%S)
+    echo "  -> Retour de la session locale vers le NAS..."
+    if [ -n "$(ls -A "$SESSION_PATH" 2>/dev/null)" ]; then
+        mv "$SESSION_PATH" "${SESSION_PATH}.perimee-${STAMP}"
+        echo "     ancienne session NFS ecartee : .session.perimee-${STAMP}"
+    fi
+    mkdir -p "$SESSION_PATH"
+    cp -a /local/session/. "$SESSION_PATH"/
+    chown -R rtorrent:rtorrent "$SESSION_PATH" 2>/dev/null || true
+    mv /local/session "/local/session.retour-nas-${STAMP}"
+    echo "     [OK] $(ls -1 "$SESSION_PATH" | wc -l) fichiers rapatries sur le NAS"
+    echo "          copie locale conservee : /local/session.retour-nas-${STAMP}"
 fi
 
 ###########################################
@@ -723,7 +756,7 @@ chown -R rtorrent:rtorrent /var/www/rutorrent 2>/dev/null || true
 chown -R rtorrent:rtorrent /var/run/rtorrent 2>/dev/null || true
 chown -R rtorrent:rtorrent /run/php 2>/dev/null || true
 
-if [ "$SESSION_PATH" = "/local/session" ]; then
+if [ "$LOCAL_MOUNTED" = "yes" ]; then
     chown -R rtorrent:rtorrent /local 2>/dev/null || true
 fi
 

@@ -41,6 +41,11 @@ NAS_SHARE_PREFIX="SEEDBOX_"
 # NAS à la complétion (voir entrypoint.sh).
 TEMP_DIR=""
 
+# Emplacement de la session rtorrent : "yes" = sur le NAS (docker_apps,
+# survit à la perte de la VM), sinon sur le disque local de la VM quand le
+# volume /local existe (plus rapide). Commandes session-nas / session-local.
+SESSION_NAS="no"
+
 # Charger la configuration si elle existe
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
@@ -64,6 +69,7 @@ SERVER_IP="${SERVER_IP}"
 SSH_PORT="${SSH_PORT}"
 NAS_IP="${NAS_IP}"
 TEMP_DIR="${TEMP_DIR}"
+SESSION_NAS="${SESSION_NAS}"
 EOF
     chmod 600 "$CONFIG_FILE"
 }
@@ -941,6 +947,12 @@ cmd_add() {
         chown "${USER_UID}:${USER_GID}" "${TEMP_DIR}/${CLIENT}" 2>/dev/null || true
         TEMP_VOLUME_LINE=$'\n'"      - ${TEMP_DIR}/${CLIENT}:/temp"
     fi
+
+    # Session rtorrent sur le NAS (politique globale, cf. session-nas)
+    local SESSION_ENV_LINE=""
+    if [ "$SESSION_NAS" = "yes" ]; then
+        SESSION_ENV_LINE=$'\n'"      - RT_SESSION_NFS=yes"
+    fi
     
     cat > "$CLIENTS_DIR/$CLIENT/docker-compose.yml" << EOF
 ###############################################
@@ -1006,7 +1018,7 @@ services:
       - RU_USER=$CLIENT
       - RU_PASSWORD=$PASSWORD
       - TOP_DIR=/data/
-      - RU_DISABLED_PLUGINS=throttle,dump
+      - RU_DISABLED_PLUGINS=throttle,dump${SESSION_ENV_LINE}
     volumes:
       - ${DOCKER_APPS_PATH}/rtorrent:/config/rtorrent
       - ${DOCKER_APPS_PATH}/rutorrent:/config/rutorrent
@@ -2694,6 +2706,138 @@ cmd_migrate_sessions() {
 }
 
 ###########################################
+# EMPLACEMENT DES SESSIONS (VM ⇄ NAS)
+###########################################
+# Politique globale : la session rtorrent vit soit sur le disque local de
+# la VM (rapide, valeur par défaut dès que le volume /local existe), soit
+# sur le NAS via RT_SESSION_NFS=yes dans l'env du compose (survit à la
+# perte de la VM). Le déplacement des fichiers de session est fait par
+# l'entrypoint au démarrage suivant, avec sauvegardes horodatées.
+
+cmd_session_nas() {
+    print_header_with_title "SESSIONS RTORRENT SUR LE NAS"
+
+    echo -e "  ${DIM}La session (liste des torrents, état des seeds) sera stockée sur le${NC}"
+    echo -e "  ${DIM}NAS : docker_apps/rtorrent/.session — elle survit à la perte de la VM.${NC}"
+    echo -e "  ${DIM}Les logs restent sur le disque local. Au redémarrage suivant, chaque${NC}"
+    echo -e "  ${DIM}conteneur rapatrie automatiquement sa session (sauvegardes conservées).${NC}"
+    echo ""
+    echo -e "  ${YELLOW}Prérequis : image reconstruite après mise à jour (menu 3), puis${NC}"
+    echo -e "  ${YELLOW}redémarrage des clients après cette opération.${NC}"
+    echo ""
+
+    read -p "  Continuer ? [o/N] " confirm
+    if [ "$confirm" != "o" ] && [ "$confirm" != "O" ]; then
+        echo ""
+        echo -e "  ${DIM}Annulé${NC}"
+        print_footer
+        return
+    fi
+
+    echo ""
+    local count=0
+    for CLIENT in $(get_clients); do
+        local compose_file="$CLIENTS_DIR/$CLIENT/docker-compose.yml"
+        [ -f "$compose_file" ] || continue
+        if grep -q "RT_SESSION_NFS=yes" "$compose_file"; then
+            echo -e "  ${DIM}-${NC} $CLIENT ${DIM}(déjà sur le NAS)${NC}"
+        else
+            cp "$compose_file" "${compose_file}.bak-$(date +%Y%m%d%H%M%S)"
+            sed -i "\|- RT_PORT=|a\\      - RT_SESSION_NFS=yes" "$compose_file"
+            if grep -q "RT_SESSION_NFS=yes" "$compose_file"; then
+                echo -e "  ${GREEN}✔${NC} $CLIENT"
+            else
+                echo -e "  ${RED}✗${NC} $CLIENT ${DIM}(insertion échouée)${NC}"
+            fi
+        fi
+        count=$((count + 1))
+    done
+
+    SESSION_NAS="yes"
+    save_config || echo -e "  ${RED}✗ Impossible d'écrire ${CONFIG_FILE}${NC}"
+
+    echo ""
+    if [ "$count" -eq 0 ]; then
+        echo -e "  ${DIM}Aucun client trouvé — la politique s'appliquera aux futurs clients.${NC}"
+    else
+        echo -e "  ${WHITE}Étape suivante :${NC} redémarrer les clients (menu Maintenance → 4)."
+        echo -e "  ${DIM}Le rapatriement de la session est automatique au démarrage.${NC}"
+    fi
+    print_footer
+}
+
+cmd_session_local() {
+    print_header_with_title "SESSIONS RTORRENT SUR LE DISQUE LOCAL"
+
+    echo -e "  ${DIM}La session revient sur le disque local de la VM (plus rapide : la${NC}"
+    echo -e "  ${DIM}sauvegarde périodique ne martèle plus le NFS). L'entrypoint recopie${NC}"
+    echo -e "  ${DIM}la session du NAS au redémarrage suivant.${NC}"
+    echo ""
+
+    read -p "  Continuer ? [o/N] " confirm
+    if [ "$confirm" != "o" ] && [ "$confirm" != "O" ]; then
+        echo ""
+        echo -e "  ${DIM}Annulé${NC}"
+        print_footer
+        return
+    fi
+
+    echo ""
+    local count=0
+    for CLIENT in $(get_clients); do
+        local compose_file="$CLIENTS_DIR/$CLIENT/docker-compose.yml"
+        [ -f "$compose_file" ] || continue
+        # S'assurer que le volume /local existe (clients d'avant la v3.1.0)
+        migrate_client_session "$CLIENT" >/dev/null 2>&1 || true
+        if grep -q "RT_SESSION_NFS=" "$compose_file"; then
+            cp "$compose_file" "${compose_file}.bak-$(date +%Y%m%d%H%M%S)"
+            sed -i "\|RT_SESSION_NFS=|d" "$compose_file"
+            echo -e "  ${GREEN}✔${NC} $CLIENT"
+        else
+            echo -e "  ${DIM}-${NC} $CLIENT ${DIM}(déjà en local)${NC}"
+        fi
+        count=$((count + 1))
+    done
+
+    SESSION_NAS="no"
+    save_config || echo -e "  ${RED}✗ Impossible d'écrire ${CONFIG_FILE}${NC}"
+
+    echo ""
+    if [ "$count" -eq 0 ]; then
+        echo -e "  ${DIM}Aucun client trouvé — la politique s'appliquera aux futurs clients.${NC}"
+    else
+        echo -e "  ${WHITE}Étape suivante :${NC} redémarrer les clients (menu Maintenance → 4)."
+    fi
+    print_footer
+}
+
+interactive_session_location() {
+    print_menu_header
+
+    echo -e "  ${WHITE}EMPLACEMENT DES SESSIONS RTORRENT${NC}"
+    line
+    echo ""
+    if [ "$SESSION_NAS" = "yes" ]; then
+        echo -e "  Politique actuelle : ${CYAN}NAS${NC} ${DIM}(docker_apps/rtorrent/.session — survit à la VM)${NC}"
+    else
+        echo -e "  Politique actuelle : ${CYAN}disque local de la VM${NC} ${DIM}(rapide, hors NFS)${NC}"
+    fi
+    echo ""
+    print_menu_option "1" "-" "Disque local de la VM ${DIM}(performances : session hors NFS)${NC}"
+    print_menu_option "2" "-" "NAS ${DIM}(sécurité : la session survit à la perte de la VM)${NC}"
+    print_menu_separator
+    print_menu_option "0" "-" "Retour"
+
+    read_choice "Votre choix" ""
+
+    case $MENU_CHOICE in
+        1) cmd_session_local; press_enter ;;
+        2) cmd_session_nas; press_enter ;;
+        *) ;;
+    esac
+}
+
+###########################################
 # DISQUE SSD TEMPORAIRE (clients existants)
 ###########################################
 # Ajoute (ou retire) le volume /temp au docker-compose des clients, sur le
@@ -3560,7 +3704,9 @@ cmd_help() {
     echo -e "  ${WHITE}optimize${NC}          Optimisation réseau & stockage NFS (profil auto)"
     echo -e "  ${WHITE}optimize-status${NC}   Voir les paramètres actifs"
     echo -e "  ${WHITE}optimize-restore${NC}  Restaurer les valeurs d'origine"
-    echo -e "  ${WHITE}migrate-sessions${NC}  Session rtorrent sur disque local"
+    echo -e "  ${WHITE}migrate-sessions${NC}  Ajouter le volume /local aux anciens clients"
+    echo -e "  ${WHITE}session-local${NC}     Sessions rtorrent sur le disque de la VM (rapide)"
+    echo -e "  ${WHITE}session-nas${NC}       Sessions rtorrent sur le NAS (survit à la VM)"
     echo -e "  ${WHITE}temp-enable${NC}       Téléchargements sur disque SSD temporaire [client]"
     echo -e "  ${WHITE}temp-disable${NC}      Revenir aux téléchargements directs NAS [client]"
     echo -e "  ${WHITE}bench-nfs${NC}         Benchmark écriture/lecture NAS <client> [mo]"
@@ -5998,7 +6144,7 @@ interactive_maintenance_menu() {
 
         print_menu_option "9" "-" "Monter tous les partages NAS"
         print_menu_option "10" "-" "Optimisation réseau & stockage NFS"
-        print_menu_option "11" "-" "Migrer les sessions vers le disque local"
+        print_menu_option "11" "-" "Emplacement des sessions rtorrent (VM locale ⇄ NAS)"
         print_menu_option "12" "-" "Activer le disque SSD temporaire (téléchargements)"
         print_menu_option "13" "-" "$(echo -e "$autostart_label")"
         print_menu_separator
@@ -6037,7 +6183,7 @@ interactive_maintenance_menu() {
             8) cmd_sequential_stop; press_enter ;;
             9) cmd_mount; press_enter ;;
             10) interactive_network_optimize_menu ;;
-            11) cmd_migrate_sessions; press_enter ;;
+            11) interactive_session_location ;;
             12) cmd_temp_enable; press_enter ;;
             13)
                 if is_autostart_enabled; then
@@ -6250,6 +6396,12 @@ case "${1}" in
         ;;
     migrate-sessions)
         cmd_migrate_sessions
+        ;;
+    session-nas)
+        cmd_session_nas
+        ;;
+    session-local)
+        cmd_session_local
         ;;
     check-ports)
         shift
