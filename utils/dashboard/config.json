@@ -1,8 +1,0 @@
-{
-    "port": "8888",
-    "admin_user": "clusmi",
-    "domain": "inseedious.ovh",
-    "sftp_port": "1000",
-    "live_enabled": false,
-    "live_interval": 500
-}
