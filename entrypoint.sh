@@ -200,9 +200,12 @@ fi
 ###########################################
 # DISQUE TEMPORAIRE (SSD) POUR LES TELECHARGEMENTS
 ###########################################
-# Si un volume est monte sur /temp (SSD local de la VM), les torrents sont
-# telecharges dedans (ecritures aleatoires absorbees par le SSD, NAS au
-# repos) puis DEPLACES vers /data/torrents/<categorie> a la completion.
+# Si un volume est monte sur /temp (SSD local de la VM), chaque nouveau
+# torrent est telecharge dans /temp/incomplet (ecritures aleatoires
+# absorbees par le SSD, NAS au repos) puis DEPLACE a la completion vers la
+# destination que l'utilisateur a choisie a l'ajout (repertoire de la
+# fenetre ruTorrent ou dossier watch) — memorisee dans le custom
+# "labobox_dest" par l'interception inserted_new.
 #
 # rtorrent etant MONOTHREAD, le deplacement ne se fait JAMAIS en synchrone
 # (un mv de 50 Go vers le NFS gelerait le client entier) : a la completion,
@@ -240,9 +243,7 @@ mkdir -p /run/nginx
 mkdir -p /run/php
 
 if [ "$TEMP_ENABLED" = "yes" ]; then
-    mkdir -p /temp/torrents/films/incomplet
-    mkdir -p /temp/torrents/series/incomplet
-    mkdir -p /temp/torrents/autres/incomplet
+    mkdir -p /temp/incomplet
 fi
 
 ###########################################
@@ -250,26 +251,14 @@ fi
 ###########################################
 echo "> Generation de rtorrent.rc..."
 
-# Destinations de telechargement : disque temporaire si present, NAS sinon.
-# Avec le disque temporaire, chaque torrent recoit aussi un label (custom1,
-# affiche par ruTorrent) qui determine sa destination finale a la completion.
-if [ "$TEMP_ENABLED" = "yes" ]; then
-    RT_DEFAULT_DIR="/temp/torrents/autres/incomplet"
-    DL_FILMS="/temp/torrents/films/incomplet"
-    DL_SERIES="/temp/torrents/series/incomplet"
-    DL_AUTRES="/temp/torrents/autres/incomplet"
-    LBL_FILMS=",d.custom1.set=films"
-    LBL_SERIES=",d.custom1.set=series"
-    LBL_AUTRES=",d.custom1.set=autres"
-else
-    RT_DEFAULT_DIR="/data/torrents"
-    DL_FILMS="/data/torrents/films"
-    DL_SERIES="/data/torrents/series"
-    DL_AUTRES="/data/torrents/autres"
-    LBL_FILMS=""
-    LBL_SERIES=""
-    LBL_AUTRES=""
-fi
+# L'utilisateur choisit toujours sa destination FINALE (repertoire de la
+# fenetre d'ajout ruTorrent, ou dossier watch). Quand le disque temporaire
+# est actif, cette destination est memorisee a l'ajout et le telechargement
+# est redirige vers /temp/incomplet ; le deplacement se fait a la
+# completion (voir le bloc DISQUE TEMPORAIRE plus bas). Sans /temp, le
+# telechargement va directement dans la destination : memes chemins,
+# memes dossiers watch dans les deux modes.
+RT_DEFAULT_DIR="/data/torrents/autres"
 
 cat > /tmp/rtorrent.rc << EOF
 ##############################################
@@ -398,9 +387,9 @@ schedule2 = scgi_permission,0,0,"execute.nothrow=chmod,\"g+w,o=\",/var/run/rtorr
 ##############################################
 # Watch directories : chaque passage = un readdir NFS par dossier.
 # A 5 secondes c'etait 36 readdir par minute pour rien.
-schedule2 = watch_films,10,${RT_WATCH_INTERVAL},"load.start=/data/watch/films/*.torrent,d.directory.set=${DL_FILMS}${LBL_FILMS}"
-schedule2 = watch_series,15,${RT_WATCH_INTERVAL},"load.start=/data/watch/series/*.torrent,d.directory.set=${DL_SERIES}${LBL_SERIES}"
-schedule2 = watch_autres,20,${RT_WATCH_INTERVAL},"load.start=/data/watch/autres/*.torrent,d.directory.set=${DL_AUTRES}${LBL_AUTRES}"
+schedule2 = watch_films,10,${RT_WATCH_INTERVAL},"load.start=/data/watch/films/*.torrent,d.directory.set=/data/torrents/films"
+schedule2 = watch_series,15,${RT_WATCH_INTERVAL},"load.start=/data/watch/series/*.torrent,d.directory.set=/data/torrents/series"
+schedule2 = watch_autres,20,${RT_WATCH_INTERVAL},"load.start=/data/watch/autres/*.torrent,d.directory.set=/data/torrents/autres"
 
 # Sauvegarde de session : 20 minutes par defaut, operation BLOQUANTE qui
 # reecrit un fichier par torrent modifie. Avec beaucoup de torrents c'est
@@ -417,20 +406,29 @@ system.umask.set = 0022
 encoding.add = UTF-8
 EOF
 
-# Deplacement automatique disque temporaire -> NAS a la completion.
+# Disque temporaire : interception a l'ajout + deplacement a la completion.
 # Heredoc QUOTE : les $d.* sont des variables rtorrent, pas bash.
-# Le torrent est stoppe puis FERME (d.close libere les fichiers, requis pour
-# changer son repertoire), et le gros du travail part en ARRIERE-PLAN via
-# execute.throw.bg : rtorrent (monothread) ne gele jamais pendant la copie.
+#
+# A l'ajout (inserted_new : jamais au rechargement de session), le
+# repertoire choisi par l'utilisateur est memorise (custom "labobox_dest")
+# puis remplace par /temp/incomplet : l'utilisateur choisit sa destination
+# FINALE comme il l'a toujours fait, le SSD s'intercale tout seul.
+#
+# A la completion, le torrent est stoppe puis FERME (d.close libere les
+# fichiers, requis pour changer son repertoire), et le gros du travail part
+# en ARRIERE-PLAN via execute.throw.bg : rtorrent (monothread) ne gele
+# jamais pendant la copie.
 if [ "$TEMP_ENABLED" = "yes" ]; then
 cat >> /tmp/rtorrent.rc << 'TEMPEOF'
 
 ##############################################
-# DISQUE TEMPORAIRE : MOVE A LA COMPLETION
+# DISQUE TEMPORAIRE : SSD PUIS DEPLACEMENT
 ##############################################
+# Memorise la destination choisie, redirige le telechargement vers le SSD.
+method.set_key = event.download.inserted_new, labobox_grab, "d.custom.set=labobox_dest,(d.directory) ; d.directory.set=/temp/incomplet"
 # d.data_path : dossier du torrent (multi-fichiers) ou fichier (mono).
 method.insert = d.data_path, simple, "if=(d.is_multi_file), (cat,(d.directory)), (cat,(d.directory),/,(d.name))"
-method.set_key = event.download.finished, labobox_move, "d.stop= ; d.close= ; execute.throw.bg=/usr/local/bin/labobox-mover,$d.hash=,$d.data_path=,$d.custom1="
+method.set_key = event.download.finished, labobox_move, "d.stop= ; d.close= ; execute.throw.bg=/usr/local/bin/labobox-mover,$d.hash=,$d.data_path=,$d.custom=labobox_dest"
 TEMPEOF
 fi
 
@@ -502,25 +500,30 @@ XMLRPCEOF
     # En cas d'echec, le torrent est relance sur place (aucune perte).
     cat > /usr/local/bin/labobox-mover << MOVEREOF
 #!/bin/bash
-# labobox-mover <hash> <chemin_donnees> <label>
+# labobox-mover <hash> <chemin_donnees> <destination_finale>
 HASH="\$1"
 SRC="\$2"
-LABEL="\$3"
+DEST="\$3"
 LOG="${LOG_PATH}/mover.log"
 
 rpc() { /usr/local/bin/labobox-xmlrpc "\$@" 2>>"\$LOG"; }
 log() { echo "\$(date '+%Y-%m-%d %H:%M:%S') \$*" >> "\$LOG"; }
 
-case "\$LABEL" in films|series|autres) ;; *) LABEL="autres" ;; esac
+# Destination : celle choisie a l'ajout (custom labobox_dest).
+# Vide ou hors /data (securite) -> /data/torrents/autres.
+DEST="\${DEST%/}"
+case "\$DEST" in
+    /data/*) ;;
+    *) DEST="/data/torrents/autres" ;;
+esac
 
-# Seuls les telechargements du disque temporaire sont deplaces : un torrent
-# ajoute avec un chemin manuel (hors /temp) est simplement relance tel quel.
+# Torrent d'avant l'activation du disque temporaire (donnees deja sur le
+# NAS) : rien a deplacer, on le relance tel quel.
 case "\$SRC" in
     /temp/*) ;;
     *) rpc d.start "\$HASH"; exit 0 ;;
 esac
 
-DEST="/data/torrents/\${LABEL}"
 BASE="\$(basename "\$SRC")"
 
 if [ ! -e "\$SRC" ]; then
