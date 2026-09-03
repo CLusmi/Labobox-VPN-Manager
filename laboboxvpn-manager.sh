@@ -35,6 +35,12 @@ NAS_IP="$DEFAULT_NAS_IP"
 NAS_MOUNT="/mnt/nas"
 NAS_SHARE_PREFIX="SEEDBOX_"
 
+# Disque temporaire (SSD) pour les téléchargements : vide = désactivé.
+# Chaque client actif y reçoit ${TEMP_DIR}/<client>, monté sur /temp dans
+# son conteneur ; les torrents y sont téléchargés puis déplacés vers le
+# NAS à la complétion (voir entrypoint.sh).
+TEMP_DIR=""
+
 # Charger la configuration si elle existe
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
@@ -57,6 +63,7 @@ save_config() {
 SERVER_IP="${SERVER_IP}"
 SSH_PORT="${SSH_PORT}"
 NAS_IP="${NAS_IP}"
+TEMP_DIR="${TEMP_DIR}"
 EOF
     chmod 600 "$CONFIG_FILE"
 }
@@ -570,8 +577,9 @@ parse_args() {
     ARG_PORT_RT=""
     ARG_UID=""
     ARG_VPN_CONFIG=""
+    ARG_TEMP=""
     OTHER_ARGS=()
-    
+
     for arg in "$@"; do
         case $arg in
             --USER=*)                   ARG_USER="${arg#*=}" ;;
@@ -580,6 +588,7 @@ parse_args() {
             --PORT_RTORRENT_VPN=*)      ARG_PORT_RT="${arg#*=}" ;;
             --UID=*)                    ARG_UID="${arg#*=}" ;;
             --VPN_CONFIG=*)             ARG_VPN_CONFIG="${arg#*=}" ;;
+            --TEMP=*)                   ARG_TEMP="${arg#*=}" ;;
             *)                          OTHER_ARGS+=("$arg") ;;
         esac
     done
@@ -792,7 +801,15 @@ cmd_add() {
     local PORT_WEBUI="${4:-$(get_next_port webui)}"
     local PORT_RT="${5:-$(get_next_port rt)}"
     local USER_UID="${6:-}"
-    
+    local USE_TEMP="${7:-}"
+
+    # Disque SSD temporaire : actif par défaut quand TEMP_DIR est configuré
+    if [ -z "$USE_TEMP" ]; then
+        USE_TEMP="no"
+        [ -n "$TEMP_DIR" ] && USE_TEMP="yes"
+    fi
+    [ -z "$TEMP_DIR" ] && USE_TEMP="no"
+
     local NAS_SHARE_NAME=$(get_nas_share_name $CLIENT)
     local CLIENT_MOUNT_PATH=$(get_client_mount_path $CLIENT)
     local DOCKER_APPS_PATH=$(get_client_docker_apps_path $CLIENT)
@@ -912,8 +929,18 @@ cmd_add() {
     
     # Étape 6: Docker compose
     print_step 6 $total_steps "Génération docker-compose.yml"
-    
+
     mkdir -p "$CLIENTS_DIR/$CLIENT"
+
+    # Disque SSD temporaire : dossier hôte + volume /temp du conteneur
+    # (la variable embarque son propre saut de ligne pour ne rien laisser
+    #  dans le compose quand l'option est désactivée)
+    local TEMP_VOLUME_LINE=""
+    if [ "$USE_TEMP" = "yes" ]; then
+        mkdir -p "${TEMP_DIR}/${CLIENT}"
+        chown "${USER_UID}:${USER_GID}" "${TEMP_DIR}/${CLIENT}" 2>/dev/null || true
+        TEMP_VOLUME_LINE=$'\n'"      - ${TEMP_DIR}/${CLIENT}:/temp"
+    fi
     
     cat > "$CLIENTS_DIR/$CLIENT/docker-compose.yml" << EOF
 ###############################################
@@ -984,7 +1011,7 @@ services:
       - ${DOCKER_APPS_PATH}/rtorrent:/config/rtorrent
       - ${DOCKER_APPS_PATH}/rutorrent:/config/rutorrent
       - ${DATA_PATH}:/data
-      - ${CLIENTS_DIR}/${CLIENT}/local:/local
+      - ${CLIENTS_DIR}/${CLIENT}/local:/local${TEMP_VOLUME_LINE}
     ulimits:
       nproc: 65535
       nofile:
@@ -1007,6 +1034,7 @@ NAS_SHARE: $NAS_SHARE_NAME
 MOUNT_PATH: $CLIENT_MOUNT_PATH
 DOCKER_APPS: $DOCKER_APPS_PATH
 DATA_PATH: $DATA_PATH
+TEMP_PATH: $([ "$USE_TEMP" = "yes" ] && echo "${TEMP_DIR}/${CLIENT}" || echo "-")
 EOF
     
     print_step_item "Conteneur VPN" "gluetun-${CLIENT}"
@@ -1078,10 +1106,15 @@ EOF
     print_item "Port torrent" "$PORT_RT"
     print_item_last "Kill switch" "Actif"
     echo ""
-    print_section "STOCKAGE NAS"
+    print_section "STOCKAGE"
     print_item "Dossier partagé" "$NAS_SHARE_NAME"
     print_item "Configs Docker" "${DOCKER_APPS_PATH}"
-    print_item_last "Données client" "${DATA_PATH}"
+    print_item "Données client" "${DATA_PATH}"
+    if [ "$USE_TEMP" = "yes" ]; then
+        print_item_last "Téléchargements" "${TEMP_DIR}/${CLIENT} ${DIM}(SSD → NAS à la complétion)${NC}"
+    else
+        print_item_last "Téléchargements" "directs sur le NAS"
+    fi
     
     # Synchroniser les bibliothèques Plex/Jellyfin/Resilio si installées
     local synced_apps=""
@@ -1179,6 +1212,10 @@ cmd_remove() {
     umount_nas_for_client "$CLIENT"
     remove_fstab_for_client "$CLIENT"
     rm -rf "$CLIENT_MOUNT_PATH" 2>/dev/null || true
+    # Dossier du disque SSD temporaire (téléchargements en cours compris)
+    if [ -n "$TEMP_DIR" ] && [ -d "${TEMP_DIR}/${CLIENT}" ]; then
+        rm -rf "${TEMP_DIR:?}/${CLIENT:?}" 2>/dev/null || true
+    fi
     echo -e "\r  ${DIM}[3/${total_steps}]${NC} Démontage et nettoyage ${DIM}...${NC} ${GREEN}✔${NC}"
     
     # Étape 4
@@ -2657,6 +2694,141 @@ cmd_migrate_sessions() {
 }
 
 ###########################################
+# DISQUE SSD TEMPORAIRE (clients existants)
+###########################################
+# Ajoute (ou retire) le volume /temp au docker-compose des clients, sur le
+# modèle de la migration des sessions. La logique de déplacement à la
+# complétion vit dans l'entrypoint de l'image : après un git pull, l'image
+# doit être reconstruite (menu Maintenance → 3) AVANT d'activer ceci.
+
+temp_enable_client() {
+    local CLIENT=$1
+    local compose_file="$CLIENTS_DIR/$CLIENT/docker-compose.yml"
+
+    if [ ! -f "$compose_file" ]; then
+        echo -e "  ${RED}✗${NC} $CLIENT ${DIM}(docker-compose.yml introuvable)${NC}"
+        return 1
+    fi
+    if grep -q ":/temp" "$compose_file"; then
+        echo -e "  ${DIM}-${NC} $CLIENT ${DIM}(déjà activé)${NC}"
+        return 0
+    fi
+
+    local USER_UID=$(id -u "$CLIENT" 2>/dev/null)
+    local USER_GID=$(id -g "$CLIENT" 2>/dev/null)
+    if [ -z "$USER_UID" ]; then
+        echo -e "  ${RED}✗${NC} $CLIENT ${DIM}(utilisateur système introuvable)${NC}"
+        return 1
+    fi
+
+    mkdir -p "${TEMP_DIR}/${CLIENT}"
+    chown "${USER_UID}:${USER_GID}" "${TEMP_DIR}/${CLIENT}" 2>/dev/null || true
+
+    cp "$compose_file" "${compose_file}.bak-$(date +%Y%m%d%H%M%S)"
+
+    # Insérer le volume après la ligne /local (clients migrés), sinon /data
+    if grep -q ":/local\$" "$compose_file"; then
+        sed -i "\|:/local\$|a\\      - ${TEMP_DIR}/${CLIENT}:/temp" "$compose_file"
+    else
+        sed -i "\|:/data\$|a\\      - ${TEMP_DIR}/${CLIENT}:/temp" "$compose_file"
+    fi
+
+    if grep -q ":/temp" "$compose_file"; then
+        echo -e "  ${GREEN}✔${NC} $CLIENT"
+        return 0
+    else
+        echo -e "  ${RED}✗${NC} $CLIENT ${DIM}(insertion du volume échouée)${NC}"
+        return 1
+    fi
+}
+
+cmd_temp_enable() {
+    local ONLY_CLIENT="$1"
+    print_header_with_title "DISQUE SSD TEMPORAIRE"
+
+    if [ -z "$TEMP_DIR" ]; then
+        print_error_box "Aucun disque temporaire configuré" "└─ Menu Maintenance → Configurer le réseau (dossier SSD)"
+        return 1
+    fi
+    if [ ! -d "$TEMP_DIR" ]; then
+        print_error_box "Le dossier ${TEMP_DIR} n'existe pas" "└─ Monte le SSD dessus avant d'activer"
+        return 1
+    fi
+
+    echo -e "  ${DIM}Ajoute le volume /temp au docker-compose des clients : téléchargements${NC}"
+    echo -e "  ${DIM}sur ${TEMP_DIR}, déplacés vers le NAS à la complétion.${NC}"
+    echo ""
+    echo -e "  ${YELLOW}Prérequis : image reconstruite après mise à jour (menu 3), puis${NC}"
+    echo -e "  ${YELLOW}redémarrage des clients concernés après cette opération.${NC}"
+    echo ""
+
+    read -p "  Continuer ? [o/N] " confirm
+    if [ "$confirm" != "o" ] && [ "$confirm" != "O" ]; then
+        echo ""
+        echo -e "  ${DIM}Annulé${NC}"
+        print_footer
+        return
+    fi
+
+    echo ""
+    local count=0
+    for CLIENT in $(get_clients); do
+        [ -n "$ONLY_CLIENT" ] && [ "$CLIENT" != "$ONLY_CLIENT" ] && continue
+        temp_enable_client "$CLIENT"
+        count=$((count + 1))
+    done
+
+    echo ""
+    if [ "$count" -eq 0 ]; then
+        echo -e "  ${DIM}Aucun client trouvé${NC}"
+    else
+        echo -e "  ${DIM}$count client(s) traité(s) — une sauvegarde .bak a été créée pour${NC}"
+        echo -e "  ${DIM}chaque docker-compose.yml modifié.${NC}"
+        echo ""
+        echo -e "  ${WHITE}Étape suivante :${NC} redémarrer les clients (menu Maintenance → 4)"
+    fi
+    print_footer
+}
+
+cmd_temp_disable() {
+    local ONLY_CLIENT="$1"
+    print_header_with_title "DISQUE SSD TEMPORAIRE — DÉSACTIVATION"
+
+    echo -e "  ${YELLOW}⚠ Les téléchargements EN COURS d'un client vivent sur son disque${NC}"
+    echo -e "  ${YELLOW}temporaire : désactiver pendant qu'ils tournent les rendrait invisibles${NC}"
+    echo -e "  ${YELLOW}au conteneur. Termine ou supprime les téléchargements en cours d'abord.${NC}"
+    echo ""
+
+    read -p "  Continuer ? [o/N] " confirm
+    if [ "$confirm" != "o" ] && [ "$confirm" != "O" ]; then
+        echo ""
+        echo -e "  ${DIM}Annulé${NC}"
+        print_footer
+        return
+    fi
+
+    echo ""
+    local count=0
+    for CLIENT in $(get_clients); do
+        [ -n "$ONLY_CLIENT" ] && [ "$CLIENT" != "$ONLY_CLIENT" ] && continue
+        local compose_file="$CLIENTS_DIR/$CLIENT/docker-compose.yml"
+        [ -f "$compose_file" ] || continue
+        if grep -q ":/temp\$" "$compose_file"; then
+            cp "$compose_file" "${compose_file}.bak-$(date +%Y%m%d%H%M%S)"
+            sed -i "\|:/temp\$|d" "$compose_file"
+            echo -e "  ${GREEN}✔${NC} $CLIENT ${DIM}(les fichiers de ${TEMP_DIR:-?}/${CLIENT} sont conservés)${NC}"
+            count=$((count + 1))
+        else
+            echo -e "  ${DIM}-${NC} $CLIENT ${DIM}(déjà désactivé)${NC}"
+        fi
+    done
+
+    echo ""
+    [ "$count" -gt 0 ] && echo -e "  ${WHITE}Étape suivante :${NC} redémarrer les clients concernés"
+    print_footer
+}
+
+###########################################
 # COMMANDE: SEQUENTIAL-START
 ###########################################
 cmd_sequential_start() {
@@ -2987,7 +3159,8 @@ cmd_config_network() {
     line
     print_item "IP de la VM" "$current_ip"
     print_item "Port SSH" "$current_ssh_port"
-    print_item_last "IP du NAS" "$NAS_IP"
+    print_item "IP du NAS" "$NAS_IP"
+    print_item_last "Disque SSD temp." "${TEMP_DIR:-désactivé}"
     echo ""
     
     echo -e "  ${WHITE}Nouvelle configuration :${NC}"
@@ -3010,7 +3183,22 @@ cmd_config_network() {
     echo -ne "  IP du NAS Synology [${current_nas_ip}] : "
     read input_nas_ip
     [ -z "$input_nas_ip" ] && input_nas_ip="$current_nas_ip"
-    
+
+    # Disque SSD temporaire (optionnel)
+    echo ""
+    echo -e "  ${DIM}Disque SSD temporaire (optionnel) : les torrents y sont téléchargés${NC}"
+    echo -e "  ${DIM}puis déplacés automatiquement vers le NAS une fois terminés.${NC}"
+    echo -ne "  Dossier du SSD temporaire [${TEMP_DIR:-aucun}] (« aucun » = désactiver) : "
+    read input_temp_dir
+    if [ -z "$input_temp_dir" ]; then
+        input_temp_dir="$TEMP_DIR"
+    elif [ "$input_temp_dir" = "aucun" ]; then
+        input_temp_dir=""
+    fi
+    if [ -n "$input_temp_dir" ] && [ ! -d "$input_temp_dir" ]; then
+        echo -e "  ${YELLOW}⚠ ${input_temp_dir} n'existe pas encore (monte le SSD dessus) — enregistré quand même.${NC}"
+    fi
+
     echo ""
     echo -e "  ${WHITE}Résumé des modifications :${NC}"
     line
@@ -3033,12 +3221,18 @@ cmd_config_network() {
     fi
     
     if [ "$input_nas_ip" != "$NAS_IP" ] && [ -n "$input_nas_ip" ]; then
-        print_item_last "IP NAS" "${NAS_IP} → ${input_nas_ip}"
+        print_item "IP NAS" "${NAS_IP} → ${input_nas_ip}"
         changes_made=1
     else
-        print_item_last "IP NAS" "${NAS_IP} (inchangé)"
+        print_item "IP NAS" "${NAS_IP} (inchangé)"
     fi
-    
+
+    if [ "$input_temp_dir" != "$TEMP_DIR" ]; then
+        print_item_last "Disque SSD temp." "${TEMP_DIR:-désactivé} → ${input_temp_dir:-désactivé}"
+    else
+        print_item_last "Disque SSD temp." "${TEMP_DIR:-désactivé} (inchangé)"
+    fi
+
     echo ""
 
     # La config stockée doit-elle être (ré)écrite ? Au premier lancement,
@@ -3049,6 +3243,7 @@ cmd_config_network() {
     [ -n "$input_server_ip" ] && [ "$SERVER_IP" != "$input_server_ip" ] && config_changed=1
     [ -n "$input_ssh_port" ] && [ "$SSH_PORT" != "$input_ssh_port" ] && config_changed=1
     [ -n "$input_nas_ip" ] && [ "$NAS_IP" != "$input_nas_ip" ] && config_changed=1
+    [ "$input_temp_dir" != "$TEMP_DIR" ] && config_changed=1
 
     if [ $changes_made -eq 0 ] && [ $config_changed -eq 0 ]; then
         echo -e "  ${DIM}Aucune modification à appliquer.${NC}"
@@ -3080,9 +3275,11 @@ cmd_config_network() {
     # « (inchangé) » : la valeur détectée (IP de la VM, port SSH) doit finir
     # dans laboboxvpn.conf même quand le système, lui, n'a rien à changer.
     local old_nas_ip="$NAS_IP"
+    local old_temp_dir="$TEMP_DIR"
     [ -n "$input_server_ip" ] && SERVER_IP="$input_server_ip"
     [ -n "$input_ssh_port" ] && SSH_PORT="$input_ssh_port"
     [ -n "$input_nas_ip" ] && NAS_IP="$input_nas_ip"
+    TEMP_DIR="$input_temp_dir"
 
     # 1. Modifier l'IP dans /etc/network/interfaces
     if [ "$input_server_ip" != "$current_ip" ] && [ -n "$input_server_ip" ]; then
@@ -3119,6 +3316,17 @@ cmd_config_network() {
     # 3. Modifier l'IP du NAS
     if [ "$NAS_IP" != "$old_nas_ip" ]; then
         echo -e "  ${GREEN}✔ IP NAS enregistrée : ${NAS_IP}${NC}"
+    fi
+
+    # 4. Disque SSD temporaire
+    if [ "$TEMP_DIR" != "$old_temp_dir" ]; then
+        if [ -n "$TEMP_DIR" ]; then
+            echo -e "  ${GREEN}✔ Disque SSD temporaire : ${TEMP_DIR}${NC}"
+            echo -e "  ${DIM}  Active-le pour les clients existants : menu Maintenance →${NC}"
+            echo -e "  ${DIM}  « Activer le disque SSD temporaire » (ou temp-enable en CLI).${NC}"
+        else
+            echo -e "  ${GREEN}✔ Disque SSD temporaire désactivé pour les futurs clients${NC}"
+        fi
     fi
     
     # Sauvegarder la configuration
@@ -3353,6 +3561,8 @@ cmd_help() {
     echo -e "  ${WHITE}optimize-status${NC}   Voir les paramètres actifs"
     echo -e "  ${WHITE}optimize-restore${NC}  Restaurer les valeurs d'origine"
     echo -e "  ${WHITE}migrate-sessions${NC}  Session rtorrent sur disque local"
+    echo -e "  ${WHITE}temp-enable${NC}       Téléchargements sur disque SSD temporaire [client]"
+    echo -e "  ${WHITE}temp-disable${NC}      Revenir aux téléchargements directs NAS [client]"
     echo -e "  ${WHITE}bench-nfs${NC}         Benchmark écriture/lecture NAS <client> [mo]"
     echo -e "  ${WHITE}bench-vpn${NC}         Benchmark débit du tunnel VPN <client>"
     echo ""
@@ -5471,7 +5681,21 @@ interactive_add_client() {
     echo -e "  UID/GID [${user_uid}] : \c"
     read custom_uid
     [ -n "$custom_uid" ] && user_uid=$custom_uid
-    
+
+    # Disque SSD temporaire (si configuré) : le choix par client
+    local use_temp="no"
+    if [ -n "$TEMP_DIR" ]; then
+        use_temp="yes"
+        echo ""
+        echo -e "  ${DIM}Disque SSD temporaire configuré : téléchargements sur ${TEMP_DIR},${NC}"
+        echo -e "  ${DIM}déplacés vers le NAS à la complétion.${NC}"
+        echo -ne "  L'utiliser pour ce client ? (oui/non) [oui] : "
+        read temp_choice
+        if [ "$temp_choice" = "non" ] || [ "$temp_choice" = "n" ]; then
+            use_temp="no"
+        fi
+    fi
+
     # Fichier VPN (EN DERNIER - pour choisir selon le port)
     echo ""
     echo -e "  ${DIM}Astuce: le fichier VPN correspond souvent au port rtorrent (ex: ${port_rt}.conf)${NC}"
@@ -5492,12 +5716,13 @@ interactive_add_client() {
     echo -e "  ├─ Partage NAS ........ $(get_nas_share_name $client_name)"
     echo -e "  ├─ Port WebUI ......... ${port_webui}"
     echo -e "  ├─ Port rtorrent ...... ${port_rt}"
-    echo -e "  └─ UID/GID ............ ${user_uid}"
+    echo -e "  ├─ UID/GID ............ ${user_uid}"
+    echo -e "  └─ Disque SSD temp. ... $([ "$use_temp" = "yes" ] && echo "oui (${TEMP_DIR}/${client_name})" || echo "non")"
     echo ""
     
     if confirm "Créer ce client ?"; then
         echo ""
-        cmd_add "$client_name" "$client_pass" "$vpn_config" "$port_webui" "$port_rt" "$user_uid"
+        cmd_add "$client_name" "$client_pass" "$vpn_config" "$port_webui" "$port_rt" "$user_uid" "$use_temp"
     else
         echo -e "  ${YELLOW}Annulé.${NC}"
     fi
@@ -5774,9 +5999,10 @@ interactive_maintenance_menu() {
         print_menu_option "9" "-" "Monter tous les partages NAS"
         print_menu_option "10" "-" "Optimisation réseau & stockage NFS"
         print_menu_option "11" "-" "Migrer les sessions vers le disque local"
-        print_menu_option "12" "-" "$(echo -e "$autostart_label")"
+        print_menu_option "12" "-" "Activer le disque SSD temporaire (téléchargements)"
+        print_menu_option "13" "-" "$(echo -e "$autostart_label")"
         print_menu_separator
-        print_menu_option "13" "-" "Désinstaller tout"
+        print_menu_option "14" "-" "Désinstaller tout"
         print_menu_separator
         print_menu_option "0" "-" "Retour"
 
@@ -5812,7 +6038,8 @@ interactive_maintenance_menu() {
             9) cmd_mount; press_enter ;;
             10) interactive_network_optimize_menu ;;
             11) cmd_migrate_sessions; press_enter ;;
-            12)
+            12) cmd_temp_enable; press_enter ;;
+            13)
                 if is_autostart_enabled; then
                     cmd_autostart_disable
                 else
@@ -5820,7 +6047,7 @@ interactive_maintenance_menu() {
                 fi
                 press_enter
                 ;;
-            13) cmd_uninstall; press_enter ;;
+            14) cmd_uninstall; press_enter ;;
             0|q|Q) return ;;
             *) ;;
         esac
@@ -5907,7 +6134,8 @@ case "${1}" in
             echo "      --VPN_CONFIG=<fichier.conf> \\"
             echo "      [--PORT_RUTORRENT_WEBUI=<port>] \\"
             echo "      [--PORT_RTORRENT_VPN=<port>] \\"
-            echo "      [--UID=<uid>]"
+            echo "      [--UID=<uid>] \\"
+            echo "      [--TEMP=yes|no]   (disque SSD temporaire, défaut: yes si configuré)"
             print_footer
             exit 1
         fi
@@ -5925,8 +6153,8 @@ case "${1}" in
         PORT_WEBUI="${ARG_PORT_WEBUI:-$(get_next_port webui)}"
         PORT_RT="${ARG_PORT_RT:-$(get_next_port rt)}"
         USER_UID="${ARG_UID:-}"
-        
-        cmd_add "$ARG_USER" "$ARG_PASSWORD" "$ARG_VPN_CONFIG" "$PORT_WEBUI" "$PORT_RT" "$USER_UID"
+
+        cmd_add "$ARG_USER" "$ARG_PASSWORD" "$ARG_VPN_CONFIG" "$PORT_WEBUI" "$PORT_RT" "$USER_UID" "$ARG_TEMP"
         ;;
     remove)
         shift
@@ -6047,6 +6275,16 @@ case "${1}" in
         ;;
     autostart-disable)
         cmd_autostart_disable
+        ;;
+    temp-enable)
+        shift
+        parse_args "$@"
+        cmd_temp_enable "${ARG_USER:-${OTHER_ARGS[0]:-}}"
+        ;;
+    temp-disable)
+        shift
+        parse_args "$@"
+        cmd_temp_disable "${ARG_USER:-${OTHER_ARGS[0]:-}}"
         ;;
     config-network)
         cmd_config_network

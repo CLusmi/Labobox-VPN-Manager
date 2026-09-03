@@ -165,6 +165,31 @@ if [ "$SESSION_PATH" = "/local/session" ]; then
 fi
 
 ###########################################
+# DISQUE TEMPORAIRE (SSD) POUR LES TELECHARGEMENTS
+###########################################
+# Si un volume est monte sur /temp (SSD local de la VM), les torrents sont
+# telecharges dedans (ecritures aleatoires absorbees par le SSD, NAS au
+# repos) puis DEPLACES vers /data/torrents/<categorie> a la completion.
+#
+# rtorrent etant MONOTHREAD, le deplacement ne se fait JAMAIS en synchrone
+# (un mv de 50 Go vers le NFS gelerait le client entier) : a la completion,
+# le torrent est stoppe, un script en ARRIERE-PLAN copie vers le NAS, puis
+# re-pointe le torrent sur sa destination via XML-RPC et le relance en seed.
+#
+# Cote manager : volume  - ${TEMP_DIR}/${CLIENT}:/temp
+
+echo "> Disque temporaire de telechargement..."
+
+if grep -q " /temp " /proc/mounts 2>/dev/null; then
+    TEMP_ENABLED="yes"
+    echo "  [OK] Volume /temp detecte -> telechargements sur disque temporaire,"
+    echo "       deplacement automatique vers le NAS a la completion"
+else
+    TEMP_ENABLED="no"
+    echo "  [-] Pas de volume /temp : telechargements directement sur /data (NAS)"
+fi
+
+###########################################
 # CREATION DES DOSSIERS
 ###########################################
 echo "> Creation des dossiers..."
@@ -181,10 +206,37 @@ mkdir -p /var/run/rtorrent
 mkdir -p /run/nginx
 mkdir -p /run/php
 
+if [ "$TEMP_ENABLED" = "yes" ]; then
+    mkdir -p /temp/torrents/films/incomplet
+    mkdir -p /temp/torrents/series/incomplet
+    mkdir -p /temp/torrents/autres/incomplet
+fi
+
 ###########################################
 # GENERATION RTORRENT.RC
 ###########################################
 echo "> Generation de rtorrent.rc..."
+
+# Destinations de telechargement : disque temporaire si present, NAS sinon.
+# Avec le disque temporaire, chaque torrent recoit aussi un label (custom1,
+# affiche par ruTorrent) qui determine sa destination finale a la completion.
+if [ "$TEMP_ENABLED" = "yes" ]; then
+    RT_DEFAULT_DIR="/temp/torrents/autres/incomplet"
+    DL_FILMS="/temp/torrents/films/incomplet"
+    DL_SERIES="/temp/torrents/series/incomplet"
+    DL_AUTRES="/temp/torrents/autres/incomplet"
+    LBL_FILMS=",d.custom1.set=films"
+    LBL_SERIES=",d.custom1.set=series"
+    LBL_AUTRES=",d.custom1.set=autres"
+else
+    RT_DEFAULT_DIR="/data/torrents"
+    DL_FILMS="/data/torrents/films"
+    DL_SERIES="/data/torrents/series"
+    DL_AUTRES="/data/torrents/autres"
+    LBL_FILMS=""
+    LBL_SERIES=""
+    LBL_AUTRES=""
+fi
 
 cat > /tmp/rtorrent.rc << EOF
 ##############################################
@@ -197,7 +249,7 @@ cat > /tmp/rtorrent.rc << EOF
 system.daemon.set = true
 
 # Chemins
-directory.default.set = /data/torrents
+directory.default.set = ${RT_DEFAULT_DIR}
 session.path.set = ${SESSION_PATH}
 
 # Ports
@@ -313,9 +365,9 @@ schedule2 = scgi_permission,0,0,"execute.nothrow=chmod,\"g+w,o=\",/var/run/rtorr
 ##############################################
 # Watch directories : chaque passage = un readdir NFS par dossier.
 # A 5 secondes c'etait 36 readdir par minute pour rien.
-schedule2 = watch_films,10,${RT_WATCH_INTERVAL},"load.start=/data/watch/films/*.torrent,d.directory.set=/data/torrents/films"
-schedule2 = watch_series,15,${RT_WATCH_INTERVAL},"load.start=/data/watch/series/*.torrent,d.directory.set=/data/torrents/series"
-schedule2 = watch_autres,20,${RT_WATCH_INTERVAL},"load.start=/data/watch/autres/*.torrent,d.directory.set=/data/torrents/autres"
+schedule2 = watch_films,10,${RT_WATCH_INTERVAL},"load.start=/data/watch/films/*.torrent,d.directory.set=${DL_FILMS}${LBL_FILMS}"
+schedule2 = watch_series,15,${RT_WATCH_INTERVAL},"load.start=/data/watch/series/*.torrent,d.directory.set=${DL_SERIES}${LBL_SERIES}"
+schedule2 = watch_autres,20,${RT_WATCH_INTERVAL},"load.start=/data/watch/autres/*.torrent,d.directory.set=${DL_AUTRES}${LBL_AUTRES}"
 
 # Sauvegarde de session : 20 minutes par defaut, operation BLOQUANTE qui
 # reecrit un fichier par torrent modifie. Avec beaucoup de torrents c'est
@@ -332,6 +384,23 @@ system.umask.set = 0022
 encoding.add = UTF-8
 EOF
 
+# Deplacement automatique disque temporaire -> NAS a la completion.
+# Heredoc QUOTE : les $d.* sont des variables rtorrent, pas bash.
+# Le torrent est stoppe puis FERME (d.close libere les fichiers, requis pour
+# changer son repertoire), et le gros du travail part en ARRIERE-PLAN via
+# execute.throw.bg : rtorrent (monothread) ne gele jamais pendant la copie.
+if [ "$TEMP_ENABLED" = "yes" ]; then
+cat >> /tmp/rtorrent.rc << 'TEMPEOF'
+
+##############################################
+# DISQUE TEMPORAIRE : MOVE A LA COMPLETION
+##############################################
+# d.data_path : dossier du torrent (multi-fichiers) ou fichier (mono).
+method.insert = d.data_path, simple, "if=(d.is_multi_file), (cat,(d.directory)), (cat,(d.directory),/,(d.name))"
+method.set_key = event.download.finished, labobox_move, "d.stop= ; d.close= ; execute.throw.bg=/usr/local/bin/labobox-mover,$d.hash=,$d.data_path=,$d.custom1="
+TEMPEOF
+fi
+
 cp /tmp/rtorrent.rc /config/rtorrent/rtorrent.rc
 chmod 644 /config/rtorrent/rtorrent.rc 2>/dev/null || true
 
@@ -342,6 +411,113 @@ if [ ! -f /config/rtorrent/rtorrent.rc ]; then
 fi
 
 echo "  [OK] rtorrent.rc cree"
+
+###########################################
+# SCRIPTS DU DISQUE TEMPORAIRE
+###########################################
+# Generes a chaque demarrage (comme les configs) : pas de rebuild d'image
+# pour les faire evoluer, il suffit de recreer le conteneur.
+
+if [ "$TEMP_ENABLED" = "yes" ]; then
+    echo "> Generation des scripts de deplacement..."
+
+    # Client XML-RPC minimal vers rtorrent (protocole SCGI sur socket unix).
+    # PHP est deja dans l'image pour ruTorrent : autant s'en servir.
+    cat > /usr/local/bin/labobox-xmlrpc << 'XMLRPCEOF'
+#!/usr/bin/php
+<?php
+// Usage: labobox-xmlrpc <methode> [param...]
+// Envoie un appel XML-RPC a rtorrent via son socket SCGI.
+$sock = '/var/run/rtorrent/scgi.socket';
+$args = array_slice($argv, 1);
+if (count($args) < 1) {
+    fwrite(STDERR, "usage: labobox-xmlrpc <methode> [param...]\n");
+    exit(2);
+}
+$method = array_shift($args);
+$params = '';
+foreach ($args as $a) {
+    $params .= '<param><value><string>' . htmlspecialchars($a, ENT_XML1) . '</string></value></param>';
+}
+$xml = '<?xml version="1.0"?><methodCall><methodName>'
+     . htmlspecialchars($method, ENT_XML1)
+     . '</methodName><params>' . $params . '</params></methodCall>';
+$headers = "CONTENT_LENGTH\x00" . strlen($xml) . "\x00SCGI\x001\x00";
+$payload = strlen($headers) . ':' . $headers . ',' . $xml;
+$fp = @stream_socket_client('unix://' . $sock, $errno, $errstr, 10);
+if (!$fp) {
+    fwrite(STDERR, "labobox-xmlrpc: connexion SCGI impossible: $errstr\n");
+    exit(1);
+}
+fwrite($fp, $payload);
+$resp = '';
+while (!feof($fp)) {
+    $resp .= fread($fp, 8192);
+}
+fclose($fp);
+if (strpos($resp, '<fault>') !== false) {
+    fwrite(STDERR, $resp . "\n");
+    exit(1);
+}
+exit(0);
+XMLRPCEOF
+    chmod 755 /usr/local/bin/labobox-xmlrpc
+
+    # Deplaceur : lance en arriere-plan par rtorrent a chaque completion.
+    # Le torrent arrive stoppe et ferme. Copie SSD -> NAS (sequentiel, le
+    # cas ideal du NAS), re-pointe le torrent, relance le seed, nettoie.
+    # En cas d'echec, le torrent est relance sur place (aucune perte).
+    cat > /usr/local/bin/labobox-mover << MOVEREOF
+#!/bin/bash
+# labobox-mover <hash> <chemin_donnees> <label>
+HASH="\$1"
+SRC="\$2"
+LABEL="\$3"
+LOG="${LOG_PATH}/mover.log"
+
+rpc() { /usr/local/bin/labobox-xmlrpc "\$@" 2>>"\$LOG"; }
+log() { echo "\$(date '+%Y-%m-%d %H:%M:%S') \$*" >> "\$LOG"; }
+
+case "\$LABEL" in films|series|autres) ;; *) LABEL="autres" ;; esac
+
+# Seuls les telechargements du disque temporaire sont deplaces : un torrent
+# ajoute avec un chemin manuel (hors /temp) est simplement relance tel quel.
+case "\$SRC" in
+    /temp/*) ;;
+    *) rpc d.start "\$HASH"; exit 0 ;;
+esac
+
+DEST="/data/torrents/\${LABEL}"
+BASE="\$(basename "\$SRC")"
+
+if [ ! -e "\$SRC" ]; then
+    log "[\$HASH] ERREUR: source absente (\$SRC)"
+    rpc d.start "\$HASH"
+    exit 1
+fi
+
+mkdir -p "\$DEST"
+log "[\$HASH] deplacement: \$SRC -> \$DEST/"
+
+if cp -a "\$SRC" "\$DEST/" 2>>"\$LOG"; then
+    rpc d.directory.set "\$HASH" "\$DEST"
+    rpc d.save_full_session "\$HASH"
+    rpc d.start "\$HASH"
+    rm -rf "\$SRC"
+    log "[\$HASH] OK: seed depuis \$DEST/\$BASE"
+else
+    # Copie partielle nettoyee, seed conserve depuis le disque temporaire
+    rm -rf "\${DEST:?}/\${BASE:?}" 2>/dev/null
+    rpc d.start "\$HASH"
+    log "[\$HASH] ERREUR: copie vers le NAS echouee (place disque ? montage ?)"
+    log "[\$HASH]         le torrent seede depuis le disque temporaire en attendant"
+fi
+exit 0
+MOVEREOF
+    chmod 755 /usr/local/bin/labobox-mover
+
+    echo "  [OK] labobox-mover + labobox-xmlrpc installes"
+fi
 
 ###########################################
 # GENERATION CONFIG RUTORRENT
@@ -551,6 +727,12 @@ if [ "$SESSION_PATH" = "/local/session" ]; then
     chown -R rtorrent:rtorrent /local 2>/dev/null || true
 fi
 
+# Disque temporaire : local (SSD), le chown recursif ne coute rien —
+# et rtorrent doit pouvoir y ecrire avec le PUID du client.
+if [ "$TEMP_ENABLED" = "yes" ]; then
+    chown -R rtorrent:rtorrent /temp 2>/dev/null || true
+fi
+
 # ATTENTION : PAS de chmod -R sur /config ni /data.
 # Un chmod recursif parcourt l'integralite de l'arbre via NFS : avec des
 # dizaines de milliers de fichiers, c'est plusieurs minutes de martelage du
@@ -651,6 +833,7 @@ echo "  Top Dir     : $TOP_DIR"
 echo "  RT Port     : $RT_PORT"
 echo "  Session     : $SESSION_PATH"
 echo "  Logs        : $LOG_PATH"
+echo "  Temp DL     : $TEMP_ENABLED"
 echo "  Open files  : $RT_MAX_OPEN_FILES / sockets : $RT_MAX_OPEN_SOCKETS"
 echo "  Peers seed  : $RT_MIN_PEERS_SEED-$RT_MAX_PEERS_SEED"
 echo "  Slots       : U $RT_MAX_UPLOADS_GLOBAL / D $RT_MAX_DOWNLOADS_GLOBAL"
