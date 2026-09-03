@@ -1,5 +1,5 @@
 ###############################################
-# RTORRENT + RUTORRENT - Image Custom v3.0.0  #
+# RTORRENT + RUTORRENT - Image Custom v3.2.0  #
 # Build depuis les sources officielles        #
 # LaboBox-VPN - 2025                          #
 ###############################################
@@ -38,19 +38,19 @@ RUN wget -q https://sourceforge.net/projects/xmlrpc-c/files/Xmlrpc-c%20Super%20S
     make -j$(nproc) && \
     make install
 
-# Compilation de libtorrent v0.16.5 (dependance de rtorrent)
+# Compilation de libtorrent v0.16.22 (dependance de rtorrent)
 RUN git clone https://github.com/rakshasa/libtorrent.git && \
     cd libtorrent && \
-    git checkout v0.16.5 && \
+    git checkout v0.16.22 && \
     autoreconf -fiv && \
     ./configure --prefix=/usr/local --disable-debug && \
     make -j$(nproc) && \
     make install
 
-# Compilation de rtorrent v0.16.5
+# Compilation de rtorrent v0.16.22
 RUN git clone https://github.com/rakshasa/rtorrent.git && \
     cd rtorrent && \
-    git checkout v0.16.5 && \
+    git checkout v0.16.22 && \
     autoreconf -fiv && \
     PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ./configure --prefix=/usr/local --with-xmlrpc-c=/usr/local/bin/xmlrpc-c-config --disable-debug && \
     make -j$(nproc) && \
@@ -63,7 +63,7 @@ FROM alpine:3.20
 
 LABEL maintainer="laboboxvpn"
 LABEL description="rtorrent + ruTorrent custom build"
-LABEL version="2.2.1"
+LABEL version="3.2.0"
 
 # Variables d'environnement par defaut
 ENV PUID=1000 \
@@ -108,6 +108,8 @@ RUN apk add --no-cache \
     php83-openssl \
     php83-xml \
     php83-dom \
+    php83-simplexml \
+    php83-zlib \
     php83-fileinfo \
     # outils
     mediainfo \
@@ -137,10 +139,10 @@ COPY --from=builder /usr/local/lib/libxmlrpc* /usr/local/lib/
 COPY --from=builder /usr/local/include/xmlrpc* /usr/local/include/
 RUN ldconfig /usr/local/lib || true
 
-# Telecharger ruTorrent v5.2.10
+# Telecharger ruTorrent v5.3.13
 WORKDIR /var/www
 RUN apk add --no-cache git && \
-    git clone --depth 1 --branch v5.2.10 https://github.com/Novik/ruTorrent.git rutorrent && \
+    git clone --depth 1 --branch v5.3.13 https://github.com/Novik/ruTorrent.git rutorrent && \
     rm -rf rutorrent/.git && \
     apk del git
 

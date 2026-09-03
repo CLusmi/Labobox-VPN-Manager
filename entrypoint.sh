@@ -1,9 +1,11 @@
 #!/bin/bash
 ###############################################
-# ENTRYPOINT - rtorrent + ruTorrent v3.1.0    #
+# ENTRYPOINT - rtorrent + ruTorrent v3.2.0    #
 # Genere les configs depuis les variables ENV #
 # LaboBox-VPN - 2026                          #
 #                                             #
+# v3.2.0 : rtorrent/libtorrent 0.16.22,       #
+#          ruTorrent 5.3.13                   #
 # v3.1.0 : optimisation stockage NFS          #
 #  - session + logs hors NFS (si volume local)#
 #  - chmod recursifs supprimes (storm NFS)    #
@@ -15,7 +17,7 @@
 set -e
 
 echo "================================================"
-echo "  RTORRENT + RUTORRENT v3.1.0 - laboboxvpn"
+echo "  RTORRENT + RUTORRENT v3.2.0 - laboboxvpn"
 echo "================================================"
 
 ###########################################
@@ -631,15 +633,6 @@ sed -i "s|LOG_PATH_PLACEHOLDER|${LOG_PATH}|g" /var/www/rutorrent/conf/config.php
 
 mkdir -p "/config/rutorrent/users/${RU_USER}/torrents"
 mkdir -p "/config/rutorrent/users/${RU_USER}/settings"
-
-###########################################
-# PATCH RUTORRENT POUR RTORRENT 0.16.x
-###########################################
-echo "> Application du patch rtorrent 0.16.x (to_kb syntax)..."
-
-sed -i 's/new rXMLRPCCommand("to_kb", floatval(1024))/new rXMLRPCCommand("to_kb", array("", floatval(1024)))/' /var/www/rutorrent/php/settings.php
-
-echo "  [OK] Patch i8 applique"
 
 ###########################################
 # CONFIGURATION NGINX

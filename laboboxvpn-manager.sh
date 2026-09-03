@@ -1,6 +1,6 @@
 #!/bin/bash
 #####################################################
-#        LaboBox-VPN - Multi users v3.0.0           #
+#        LaboBox-VPN - Multi users v3.2.0           #
 #    Multi-User rtorrent/ruTorrent + WireGuard      #
 #               By CLusmi - 2026                    #
 #####################################################
@@ -13,7 +13,7 @@
 INSTALL_DIR="/opt/laboboxvpn"
 CLIENTS_DIR="${INSTALL_DIR}/clients"
 UTILS_DIR="${INSTALL_DIR}/utils"
-VERSION="3.1.0"
+VERSION="3.2.0"
 
 # Délais de démarrage séquentiel (en secondes)
 STARTUP_DELAY=10                    # Délai entre chaque client
