@@ -2758,12 +2758,19 @@ cmd_build() {
 # annulait le writeback en bytes).
 
 cmd_optimize() {
-    if [ -f "$UTILS_DIR/network-optimize.sh" ]; then
-        bash "$UTILS_DIR/network-optimize.sh" "$@"
-    else
+    local opt="$UTILS_DIR/network-optimize.sh"
+    if [ ! -f "$opt" ]; then
         print_error_box "Script d'optimisation non trouvé" "└─ Copiez network-optimize.sh dans $UTILS_DIR"
         return 1
     fi
+    # Garde-fou CRLF : si le fichier a été récupéré avec des fins de ligne
+    # Windows (git core.autocrlf, éditeur…), bash le rejette avec des erreurs
+    # « $'\r' : commande introuvable ». On normalise en LF une bonne fois
+    # (le dépôt est en LF : après ça, aucun diff git).
+    if grep -q $'\r' "$opt" 2>/dev/null; then
+        sed -i 's/\r$//' "$opt" 2>/dev/null || true
+    fi
+    bash "$opt" "$@"
 }
 
 ###########################################

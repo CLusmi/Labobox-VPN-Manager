@@ -429,7 +429,13 @@ method.set_key = event.download.inserted_new, labobox_guard, "execute.throw.bg=/
 method.set_key = event.download.inserted_new, labobox_grab, "d.custom.set=labobox_dest,(d.directory) ; d.directory.set=(execute.capture,/usr/local/bin/labobox-ssdpath,(d.directory))"
 # d.data_path : dossier du torrent (multi-fichiers) ou fichier (mono).
 method.insert = d.data_path, simple, "if=(d.is_multi_file), (cat,(d.directory)), (cat,(d.directory),/,(d.name))"
-method.set_key = event.download.finished, labobox_move, "d.stop= ; d.close= ; execute.throw.bg=/usr/local/bin/labobox-mover,$d.hash=,$d.data_path=,$d.custom=labobox_dest"
+# A la completion : on lance UNIQUEMENT le deplaceur en arriere-plan. On NE
+# stoppe NI ne ferme le torrent ici : il continue de seeder depuis le SSD
+# pendant la copie, et rtorrent (monothread) ne gele donc pas au moment de la
+# completion. C'est le deplaceur qui, une fois la copie finie, stoppe/ferme/
+# re-pointe/relance via XML-RPC — a ce moment les donnees sont deja a plat
+# (plus rien a vider), donc le bref arret est independant de la taille.
+method.set_key = event.download.finished, labobox_move, "execute.throw.bg=/usr/local/bin/labobox-mover,$d.hash=,$d.data_path=,$d.custom=labobox_dest"
 TEMPEOF
 fi
 
@@ -535,10 +541,14 @@ exit 0
 GUARDEOF
     chmod 755 /usr/local/bin/labobox-guard
 
-    # Deplaceur : lance en arriere-plan par rtorrent a chaque completion.
-    # Le torrent arrive stoppe et ferme. Copie SSD -> NAS (sequentiel, le
-    # cas ideal du NAS), re-pointe le torrent, relance le seed, nettoie.
-    # En cas d'echec, le torrent est relance sur place (aucune perte).
+    # Deplaceur : lance en arriere-plan a la completion, torrent TOUJOURS EN
+    # SEED depuis le SSD. Copie SSD -> NAS (sequentiel, le cas ideal du NAS)
+    # SANS interrompre le seed. Une fois la copie terminee seulement, bref
+    # basculement via XML-RPC : stop -> close -> re-pointe -> start. A ce
+    # moment les donnees sont deja a plat (le torrent seedait, rien a vider),
+    # donc l'arret est de l'ordre de la milliseconde, quelle que soit la
+    # taille du fichier. En cas d'echec de copie : le seed continue depuis le
+    # SSD, rien n'est touche (aucune perte).
     cat > /usr/local/bin/labobox-mover << MOVEREOF
 #!/bin/bash
 # labobox-mover <hash> <chemin_donnees> <destination_finale>
@@ -558,34 +568,39 @@ case "\$DEST" in
     *) DEST="/data/torrents/autres" ;;
 esac
 
-# Torrent d'avant l'activation du disque temporaire (donnees deja sur le
-# NAS) : rien a deplacer, on le relance tel quel.
+# Torrent d'avant l'activation du disque temporaire (donnees deja hors /temp) :
+# rien a deplacer, il seede deja sur place -> on ne touche a rien.
 case "\$SRC" in
     /temp/*) ;;
-    *) rpc d.start "\$HASH"; exit 0 ;;
+    *) exit 0 ;;
 esac
 
 BASE="\$(basename "\$SRC")"
 
 if [ ! -e "\$SRC" ]; then
-    log "[\$HASH] ERREUR: source absente (\$SRC)"
-    rpc d.start "\$HASH"
+    log "[\$HASH] ERREUR: source absente (\$SRC) - seed inchange"
     exit 1
 fi
 
 mkdir -p "\$DEST"
-log "[\$HASH] deplacement: \$SRC -> \$DEST/"
+log "[\$HASH] copie SSD -> NAS (seed en cours): \$SRC -> \$DEST/"
 
-if cp -a "\$SRC" "\$DEST/" 2>>"\$LOG"; then
+# Copie sans preservation de proprietaire (cp -a echouerait sur NFS en
+# non-root : « Operation not permitted »). Les fichiers appartiennent au
+# client qui ecrit, c'est ce qu'on veut cote NAS.
+if cp -r "\$SRC" "\$DEST/" 2>>"\$LOG"; then
+    # Donnees a plat sur le NAS : bascule breve (torrent seedait -> rien a vider)
+    rpc d.stop "\$HASH"
+    rpc d.close "\$HASH"
     rpc d.directory.set "\$HASH" "\$DEST"
-    rpc d.save_full_session "\$HASH"
     rpc d.start "\$HASH"
+    rpc d.save_full_session "\$HASH"
     rm -rf "\$SRC"
     log "[\$HASH] OK: seed depuis \$DEST/\$BASE"
 else
-    # Copie partielle nettoyee, seed conserve depuis le disque temporaire
+    # Copie partielle nettoyee ; le torrent continue de seeder depuis le SSD
+    # (il n'a jamais ete stoppe) : aucune perte, on retentera au besoin.
     rm -rf "\${DEST:?}/\${BASE:?}" 2>/dev/null
-    rpc d.start "\$HASH"
     log "[\$HASH] ERREUR: copie vers le NAS echouee (place disque ? montage ?)"
     log "[\$HASH]         le torrent seede depuis le disque temporaire en attendant"
 fi

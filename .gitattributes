@@ -1,0 +1,9 @@
+# Forcer les fins de ligne LF pour tout ce qui est exécuté par bash / dans
+# l'image : un checkout en CRLF (git core.autocrlf sous Windows, éditeur…)
+# casse rtorrent (entrypoint) et l'optimiseur (« $'\r' : commande introuvable »).
+*.sh    text eol=lf
+Dockerfile text eol=lf
+entrypoint.sh text eol=lf
+*.json  text eol=lf
+*.go    text eol=lf
+*.html  text eol=lf
