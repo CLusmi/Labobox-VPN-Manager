@@ -38,19 +38,22 @@ RUN wget -q https://sourceforge.net/projects/xmlrpc-c/files/Xmlrpc-c%20Super%20S
     make -j$(nproc) && \
     make install
 
-# Compilation de libtorrent v0.16.22 (dependance de rtorrent)
+# Compilation de libtorrent v0.16.5 (dependance de rtorrent)
+# NOTE : rester en 0.16.5. Les tags >= 0.16.x recents renomment des
+# commandes du .rc (ex. network.port_range.set -> network.listen.port.range.set),
+# ce qui empeche rtorrent de demarrer avec la config actuelle.
 RUN git clone https://github.com/rakshasa/libtorrent.git && \
     cd libtorrent && \
-    git checkout v0.16.22 && \
+    git checkout v0.16.5 && \
     autoreconf -fiv && \
     ./configure --prefix=/usr/local --disable-debug && \
     make -j$(nproc) && \
     make install
 
-# Compilation de rtorrent v0.16.22
+# Compilation de rtorrent v0.16.5 (voir NOTE libtorrent ci-dessus)
 RUN git clone https://github.com/rakshasa/rtorrent.git && \
     cd rtorrent && \
-    git checkout v0.16.22 && \
+    git checkout v0.16.5 && \
     autoreconf -fiv && \
     PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ./configure --prefix=/usr/local --with-xmlrpc-c=/usr/local/bin/xmlrpc-c-config --disable-debug && \
     make -j$(nproc) && \

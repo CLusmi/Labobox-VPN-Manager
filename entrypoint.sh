@@ -4,8 +4,8 @@
 # Genere les configs depuis les variables ENV #
 # LaboBox-VPN - 2026                          #
 #                                             #
-# v3.2.0 : rtorrent/libtorrent 0.16.22,       #
-#          ruTorrent 5.3.13                   #
+# v3.2.0 : ruTorrent 5.3.13 + php simplexml   #
+#          (rtorrent reste en 0.16.5, stable) #
 # v3.1.0 : optimisation stockage NFS          #
 #  - session + logs hors NFS (si volume local)#
 #  - chmod recursifs supprimes (storm NFS)    #
