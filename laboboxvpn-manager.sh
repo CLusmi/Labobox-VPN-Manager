@@ -13,7 +13,7 @@
 INSTALL_DIR="/opt/laboboxvpn"
 CLIENTS_DIR="${INSTALL_DIR}/clients"
 UTILS_DIR="${INSTALL_DIR}/utils"
-VERSION="3.0.0"
+VERSION="3.1.0"
 
 # Délais de démarrage séquentiel (en secondes)
 STARTUP_DELAY=10                    # Délai entre chaque client
@@ -351,33 +351,6 @@ is_system_initialized() {
 # Vérifie si l'image Docker est buildée
 is_image_built() {
     if docker images 2>/dev/null | grep -q "laboboxvpn/rtorrent-rutorrent"; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Vérifie si Docker est installé
-is_docker_installed() {
-    if command -v docker &> /dev/null && docker info &> /dev/null 2>&1; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Vérifie si NFS est installé
-is_nfs_installed() {
-    if command -v mount.nfs &> /dev/null; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Vérifie si le NAS est configuré
-is_nas_configured() {
-    if [ "$NAS_IP" != "A_CONFIGURER" ]; then
         return 0
     else
         return 1
