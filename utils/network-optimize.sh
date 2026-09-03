@@ -36,7 +36,7 @@ set -o pipefail
 # écrits en dur en français, ne sont pas concernés.
 export LC_ALL=C
 
-VERSION="4.0.0"
+VERSION="4.1.0"
 
 #--- Chemins -------------------------------------------------------------------
 INSTALL_DIR="/opt/laboboxvpn"
@@ -388,9 +388,12 @@ vm.max_map_count = 262144
 # Writeback en BYTES et non en ratio (ces clés remplacent vm.dirty_ratio /
 # vm.dirty_background_ratio, mises à zéro automatiquement par le noyau) :
 # le flush vers le NAS démarre à $(fmt_bytes "$OPT_DIRTY_BG_BYTES") en tâche de fond et ne peut
-# jamais accumuler plus de $(fmt_bytes "$OPT_DIRTY_BYTES") — continu au lieu d'explosif, les
-# disques mécaniques du NAS ne prennent plus de rafale et rtorrent ne gèle
-# plus pendant les gros flushs.
+# jamais accumuler plus de $(fmt_bytes "$OPT_DIRTY_BYTES") — continu au lieu d'explosif.
+# Depuis la v3.3, le NAS ne reçoit plus les écritures aléatoires du download
+# (absorbées par le SSD) mais la grosse COPIE SÉQUENTIELLE du déplaceur +
+# les lectures de seed : un flush continu et borné reste le bon réglage
+# (une copie de 50 Go ne doit pas remplir le cache d'un coup), et rtorrent ne
+# gèle jamais pendant ces flushs.
 vm.dirty_background_bytes = ${OPT_DIRTY_BG_BYTES}
 vm.dirty_bytes = ${OPT_DIRTY_BYTES}
 # Pages sales écrites au plus tard après 10 s, flusher réveillé chaque
@@ -600,6 +603,29 @@ if [ "$PROFILE" != "pve-host" ]; then
         CPU=$(( (CPU + 1) % NUM_CPUS ))
     done
 fi
+
+# --- Disques SSD (téléchargement temporaire) --------------------------------
+# Depuis la v3.3, les téléchargements atterrissent sur un SSD local avant
+# d'être recopiés SÉQUENTIELLEMENT vers le NAS. On aligne l'ordonnanceur d'E/S
+# des disques NON rotatifs sur leur nature (« none » pour un NVMe qui gère ses
+# propres files, « mq-deadline » pour un SSD SATA/USB), on élargit le
+# read-ahead et la profondeur de file : les lectures de seed et la grosse
+# copie séquentielle vers le NAS en profitent. Tout est best-effort.
+for DISK in /sys/block/*; do
+    DEV=$(basename "$DISK")
+    case "$DEV" in loop*|ram*|dm-*|sr*|zram*|md*) continue ;; esac
+    [ -r "$DISK/queue/rotational" ] || continue
+    [ "$(cat "$DISK/queue/rotational" 2>/dev/null)" = "0" ] || continue
+    if [ -w "$DISK/queue/scheduler" ]; then
+        case "$DEV" in
+            nvme*) grep -qw none        "$DISK/queue/scheduler" 2>/dev/null && echo none        > "$DISK/queue/scheduler" 2>/dev/null || true ;;
+            *)     grep -qw mq-deadline  "$DISK/queue/scheduler" 2>/dev/null && echo mq-deadline > "$DISK/queue/scheduler" 2>/dev/null || true ;;
+        esac
+    fi
+    [ -w "$DISK/queue/read_ahead_kb" ] && echo 2048 > "$DISK/queue/read_ahead_kb" 2>/dev/null || true
+    [ -w "$DISK/queue/nr_requests" ]   && echo 512  > "$DISK/queue/nr_requests"   2>/dev/null || true
+    echo "storage-tune: ${DEV} (non rotatif) ordonnanceur + read-ahead ajustés"
+done
 
 exit 0
 TUNE_EOF

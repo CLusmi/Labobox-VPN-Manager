@@ -1,5 +1,5 @@
 ###############################################
-# RTORRENT + RUTORRENT - Image Custom v3.2.0  #
+# RTORRENT + RUTORRENT - Image Custom v3.3.0  #
 # Build depuis les sources officielles        #
 # LaboBox-VPN - 2025                          #
 ###############################################
@@ -66,7 +66,7 @@ FROM alpine:3.20
 
 LABEL maintainer="laboboxvpn"
 LABEL description="rtorrent + ruTorrent custom build"
-LABEL version="3.2.0"
+LABEL version="3.3.0"
 
 # Variables d'environnement par defaut
 ENV PUID=1000 \
@@ -142,10 +142,10 @@ COPY --from=builder /usr/local/lib/libxmlrpc* /usr/local/lib/
 COPY --from=builder /usr/local/include/xmlrpc* /usr/local/include/
 RUN ldconfig /usr/local/lib || true
 
-# Telecharger ruTorrent v5.3.13
+# Telecharger ruTorrent v5.2.10 (version de base eprouvee avec rtorrent 0.16.5)
 WORKDIR /var/www
 RUN apk add --no-cache git && \
-    git clone --depth 1 --branch v5.3.13 https://github.com/Novik/ruTorrent.git rutorrent && \
+    git clone --depth 1 --branch v5.2.10 https://github.com/Novik/ruTorrent.git rutorrent && \
     rm -rf rutorrent/.git && \
     apk del git
 

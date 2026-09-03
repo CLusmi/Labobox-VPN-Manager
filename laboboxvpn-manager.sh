@@ -1,6 +1,6 @@
 #!/bin/bash
 #####################################################
-#        LaboBox-VPN - Multi users v3.2.0           #
+#        LaboBox-VPN - Multi users v3.3.0           #
 #    Multi-User rtorrent/ruTorrent + WireGuard      #
 #               By CLusmi - 2026                    #
 #####################################################
@@ -13,7 +13,7 @@
 INSTALL_DIR="/opt/laboboxvpn"
 CLIENTS_DIR="${INSTALL_DIR}/clients"
 UTILS_DIR="${INSTALL_DIR}/utils"
-VERSION="3.2.0"
+VERSION="3.3.0"
 
 # Délais de démarrage séquentiel (en secondes)
 STARTUP_DELAY=10                    # Délai entre chaque client
@@ -41,10 +41,10 @@ NAS_SHARE_PREFIX="SEEDBOX_"
 # NAS à la complétion (voir entrypoint.sh).
 TEMP_DIR=""
 
-# Emplacement de la session rtorrent : "yes" = sur le NAS (docker_apps,
-# survit à la perte de la VM), sinon sur le disque local de la VM quand le
-# volume /local existe (plus rapide). Commandes session-nas / session-local.
-SESSION_NAS="no"
+# Taille maximale d'un torrent accepté à l'ajout (garde-fou), en octets.
+# Un torrent plus gros est refusé (stoppé + effacé, journalisé). 0 = illimité.
+# Défaut : 6 To (6 * 1024^4). Modifiable via le menu Monitoring.
+MAX_TORRENT_SIZE="6597069766656"
 
 # Charger la configuration si elle existe
 load_config() {
@@ -69,7 +69,7 @@ SERVER_IP="${SERVER_IP}"
 SSH_PORT="${SSH_PORT}"
 NAS_IP="${NAS_IP}"
 TEMP_DIR="${TEMP_DIR}"
-SESSION_NAS="${SESSION_NAS}"
+MAX_TORRENT_SIZE="${MAX_TORRENT_SIZE}"
 EOF
     chmod 600 "$CONFIG_FILE"
 }
@@ -921,12 +921,6 @@ cmd_add() {
         TEMP_VOLUME_LINE=$'\n'"      - ${TEMP_DIR}/${CLIENT}:/temp"
     fi
 
-    # Session rtorrent sur le NAS (politique globale, cf. session-nas)
-    local SESSION_ENV_LINE=""
-    if [ "$SESSION_NAS" = "yes" ]; then
-        SESSION_ENV_LINE=$'\n'"      - RT_SESSION_NFS=yes"
-    fi
-    
     cat > "$CLIENTS_DIR/$CLIENT/docker-compose.yml" << EOF
 ###############################################
 # CLIENT: $CLIENT
@@ -991,7 +985,8 @@ services:
       - RU_USER=$CLIENT
       - RU_PASSWORD=$PASSWORD
       - TOP_DIR=/data/
-      - RU_DISABLED_PLUGINS=throttle,dump${SESSION_ENV_LINE}
+      - RU_DISABLED_PLUGINS=throttle,dump
+      - RT_MAX_TORRENT_SIZE=${MAX_TORRENT_SIZE:-0}
     volumes:
       - ${DOCKER_APPS_PATH}/rtorrent:/config/rtorrent
       - ${DOCKER_APPS_PATH}/rutorrent:/config/rutorrent
@@ -1599,22 +1594,58 @@ cmd_restart() {
 cmd_logs() {
     local CLIENT=$1
     local SERVICE=${2:-rtorrent}
-    
+
     if ! client_exists "$CLIENT"; then
         print_error_box "Le client '${CLIENT}' n'existe pas."
         return 1
     fi
-    
+
+    local container="rtorrent-${CLIENT}"
+    [ "$SERVICE" = "gluetun" ] && container="gluetun-${CLIENT}"
+
     echo ""
     echo -e "  ${DIM}══════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "  ${WHITE}LOGS: ${SERVICE}-${CLIENT}${NC}"
+    echo -e "  ${WHITE}LOGS: ${container}${NC}"
     echo -e "  ${DIM}══════════════════════════════════════════════════════════════════════${NC}"
     echo ""
-    
-    if [ "$SERVICE" == "gluetun" ]; then
-        docker logs -f --tail 100 gluetun-$CLIENT
+
+    # Le conteneur existe-t-il (demarre OU arrete mais pas supprime) ?
+    # Un `docker compose down` supprime le conteneur : `docker logs` echouait
+    # alors avec « No such container ». On bascule sur le fichier de log.
+    if docker inspect "$container" >/dev/null 2>&1; then
+        local running
+        running=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)
+        if [ "$running" = "true" ]; then
+            echo -e "  ${DIM}Flux en direct — Ctrl-C pour quitter.${NC}"
+            echo ""
+            docker logs -f --tail 150 "$container"
+        else
+            echo -e "  ${YELLOW}Conteneur arrêté — 150 dernières lignes :${NC}"
+            echo ""
+            docker logs --tail 150 "$container" 2>&1
+        fi
+        return 0
+    fi
+
+    # Conteneur inexistant : lire directement le fichier de log sur l'hote.
+    echo -e "  ${YELLOW}Conteneur non démarré${NC} ${DIM}(client arrêté).${NC}"
+    if [ "$SERVICE" = "gluetun" ]; then
+        echo -e "  ${DIM}Les logs VPN ne sont visibles que conteneur démarré (menu → démarrer).${NC}"
+        return 0
+    fi
+
+    local logdir="${CLIENTS_DIR}/${CLIENT}/local/log"
+    if [ -f "${logdir}/rtorrent.log" ]; then
+        echo -e "  ${DIM}Lecture de ${logdir}/rtorrent.log (150 dernières lignes)${NC}"
+        echo ""
+        tail -n 150 "${logdir}/rtorrent.log"
+        if [ -f "${logdir}/mover.log" ]; then
+            echo ""
+            echo -e "  ${WHITE}— Journal des déplacements SSD → NAS (mover.log) —${NC}"
+            tail -n 20 "${logdir}/mover.log"
+        fi
     else
-        docker logs -f --tail 100 rtorrent-$CLIENT
+        print_error_box "Aucun log disponible" "└─ Conteneur arrêté et aucun rtorrent.log dans ${logdir}"
     fi
 }
 
@@ -2363,6 +2394,159 @@ cmd_bench_vpn() {
     print_footer
 }
 
+# Liste de sources ~1 Go (fichiers STATIQUES, miroirs FR). Partagee par les
+# benchmarks. Format : url|sonde|octets|nom.
+bench_sources_list() {
+    printf '%s\n' \
+        "http://test-debit.free.fr/1048576.rnd|RANGE:http://test-debit.free.fr/1048576.rnd|1073741824|Free" \
+        "https://scaleway.testdebit.info/1G.iso|https://scaleway.testdebit.info/1M.iso|1000000000|Scaleway" \
+        "http://ping.online.net/1000Mo.dat|http://ping.online.net/1Mo.dat|1000000000|Online.net" \
+        "https://rbx.proof.ovh.net/files/1Gb.dat|https://rbx.proof.ovh.net/files/1Mb.dat|1073741824|OVH (RBX)"
+}
+
+# Choisit la 1re source qui repond a la sonde en direct. Remplit les globales
+# BENCH_URL / BENCH_BYTES / BENCH_LABEL. Retour 1 si aucune.
+bench_pick_source() {
+    local url probe bytes lbl
+    BENCH_URL=""; BENCH_BYTES=""; BENCH_LABEL=""
+    while IFS='|' read -r url probe bytes lbl; do
+        [ -n "$url" ] || continue
+        echo -ne "\r  ${DIM}Sonde de ${lbl}...${NC}                                        "
+        if bench_probe_direct "$probe"; then
+            BENCH_URL="$url"; BENCH_BYTES="$bytes"; BENCH_LABEL="$lbl"
+            echo -e "\r  ${GREEN}✔${NC} Source retenue : ${lbl} — $(bench_fmt_size "$bytes") par passe        "
+            return 0
+        fi
+    done < <(bench_sources_list)
+    echo -e "\r  ${RED}✗${NC} Aucune source de test joignable en direct.                              "
+    return 1
+}
+
+# dd ecriture (fdatasync) puis lecture (directe) sur un dossier. Affiche la
+# progression et renseigne les variables passees par nom (write/read).
+# Usage : bench_dd_dir <dossier> <taille_mo> <var_write> <var_read>
+bench_dd_dir() {
+    local dir="$1" mb="$2" __w="$3" __r="$4"
+    local target="${dir}/.labobox-bench.tmp" bytes=$((mb * 1024 * 1024)) s e
+    mkdir -p "$dir" 2>/dev/null
+    echo -e "  ${DIM}  écriture ${mb} Mo (fdatasync) :${NC}"
+    s=$(date +%s%N)
+    if dd if=/dev/zero of="$target" bs=1M count="$mb" conv=fdatasync status=progress 2>&1 >/dev/null; then
+        e=$(date +%s%N); printf -v "$__w" '%s' "$(bench_speed "$bytes" $((e - s)))"
+    else
+        printf -v "$__w" '%s' "échec"
+    fi
+    echo -e "  ${DIM}  lecture directe :${NC}"
+    s=$(date +%s%N)
+    if dd if="$target" of=/dev/null bs=1M iflag=direct status=progress 2>&1; then
+        e=$(date +%s%N); printf -v "$__r" '%s' "$(bench_speed "$bytes" $((e - s)))"
+    else
+        printf -v "$__r" '%s' "n/a"
+    fi
+    rm -f "$target" 2>/dev/null
+}
+
+# Telechargement d'un fichier ~1 Go À TRAVERS LE TUNNEL, ecrit sur un disque.
+# Le wget tourne dans le conteneur rtorrent (il partage le reseau de Gluetun
+# ET voit /data et /temp). Renseigne la variable passee par nom.
+# Usage : bench_vpn_to_disk <client> <chemin_dans_conteneur> <hote_a_nettoyer> <var_res>
+bench_vpn_to_disk() {
+    local client="$1" inpath="$2" hostclean="$3" __res="$4"
+    local s e
+    s=$(date +%s%N)
+    if timeout 900 docker exec -t "rtorrent-${client}" sh -c "wget -T 60 -O '$inpath' '$BENCH_URL'" ; then
+        e=$(date +%s%N); printf -v "$__res" '%s' "$(bench_speed "$BENCH_BYTES" $((e - s)))"
+    else
+        printf -v "$__res" '%s' "échec"
+    fi
+    rm -f "$hostclean" 2>/dev/null
+    docker exec "rtorrent-${client}" rm -f "$inpath" 2>/dev/null || true
+}
+
+# BENCHMARK 4 VOIES : disque NFS direct, disque SSD direct, VPN->NFS, VPN->SSD.
+cmd_bench_all() {
+    local CLIENT="$1"
+    local SIZE_MB=1024
+
+    print_header_with_title "BENCHMARK COMPLET — DISQUES & VPN"
+
+    if [ -z "$CLIENT" ] || ! client_exists "$CLIENT"; then
+        print_error_box "Client requis : bench <client>"
+        return 1
+    fi
+
+    local mount_path ssd_host="" have_nfs="no" have_ssd="no" have_vpn="no"
+    mount_path=$(get_client_mount_path "$CLIENT")
+    mountpoint -q "$mount_path" 2>/dev/null && have_nfs="yes"
+    if [ -n "$TEMP_DIR" ] && [ -d "${TEMP_DIR}/${CLIENT}" ]; then
+        ssd_host="${TEMP_DIR}/${CLIENT}"; have_ssd="yes"
+    fi
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "rtorrent-${CLIENT}" && have_vpn="yes"
+
+    echo -e "  ${DIM}Fichiers de test ~1 Go, supprimés à la fin. Disques : dd local.${NC}"
+    echo -e "  ${DIM}VPN : téléchargement réel à travers le tunnel, écrit sur le disque.${NC}"
+    echo ""
+    echo -e "  ${DIM}NAS monté : ${have_nfs} │ SSD temp : ${have_ssd} │ conteneur (VPN) : ${have_vpn}${NC}"
+    echo ""
+
+    local nfs_w="—" nfs_r="—" ssd_w="—" ssd_r="—" vpn_nfs="—" vpn_ssd="—"
+
+    # --- Disque NFS (direct, sans VPN) ---
+    if [ "$have_nfs" = "yes" ]; then
+        echo -e "  ${WHITE}1/4 · Disque NAS (NFS), en direct${NC}"
+        bench_dd_dir "$mount_path" "$SIZE_MB" nfs_w nfs_r
+        echo ""
+    else
+        echo -e "  ${YELLOW}1/4 · Disque NAS ignoré (partage non monté)${NC}"; echo ""
+    fi
+
+    # --- Disque SSD (direct, sans VPN) ---
+    if [ "$have_ssd" = "yes" ]; then
+        echo -e "  ${WHITE}2/4 · Disque SSD temporaire, en direct${NC}"
+        bench_dd_dir "$ssd_host" "$SIZE_MB" ssd_w ssd_r
+        echo ""
+    else
+        echo -e "  ${YELLOW}2/4 · Disque SSD ignoré (non configuré/monté)${NC}"; echo ""
+    fi
+
+    # --- VPN -> disques (téléchargement réel dans le conteneur) ---
+    if [ "$have_vpn" = "yes" ]; then
+        echo -e "  ${WHITE}Sélection d'une source de test (~1 Go)…${NC}"
+        if bench_pick_source; then
+            echo ""
+            echo -e "  ${WHITE}3/4 · VPN → NAS (téléchargement tunnel, écriture NFS)${NC}"
+            bench_vpn_to_disk "$CLIENT" "/data/.labobox-bench.tmp" "${mount_path}/.labobox-bench.tmp" vpn_nfs
+            echo ""
+            if [ "$have_ssd" = "yes" ]; then
+                echo -e "  ${WHITE}4/4 · VPN → SSD (téléchargement tunnel, écriture SSD)${NC}"
+                bench_vpn_to_disk "$CLIENT" "/temp/.labobox-bench.tmp" "${ssd_host}/.labobox-bench.tmp" vpn_ssd
+                echo ""
+            else
+                echo -e "  ${YELLOW}4/4 · VPN → SSD ignoré (SSD non actif)${NC}"; echo ""
+            fi
+        else
+            echo -e "  ${YELLOW}Volets VPN ignorés (aucune source joignable).${NC}"; echo ""
+        fi
+    else
+        echo -e "  ${YELLOW}3-4/4 · Volets VPN ignorés (client arrêté)${NC}"; echo ""
+    fi
+
+    # --- Récapitulatif ---
+    line
+    echo -e "  ${WHITE}Récapitulatif${NC}"
+    line
+    printf "  %-26s %-22s %-22s\n" "" "écriture" "lecture"
+    printf "  %-26s ${GREEN}%-22s${NC} ${GREEN}%-22s${NC}\n" "Disque NAS (NFS) direct" "$nfs_w" "$nfs_r"
+    printf "  %-26s ${GREEN}%-22s${NC} ${GREEN}%-22s${NC}\n" "Disque SSD direct" "$ssd_w" "$ssd_r"
+    printf "  %-26s ${CYAN}%-22s${NC}\n" "VPN → NAS (download)" "$vpn_nfs"
+    printf "  %-26s ${CYAN}%-22s${NC}\n" "VPN → SSD (download)" "$vpn_ssd"
+    echo ""
+    echo -e "  ${DIM}Lecture : si « VPN → SSD » > « VPN → NAS », l'écriture NFS bridait le${NC}"
+    echo -e "  ${DIM}download → le SSD apporte un vrai gain. S'ils sont proches, le tunnel${NC}"
+    echo -e "  ${DIM}est le facteur limitant (le SSD protège quand même le NAS).${NC}"
+    print_footer
+}
+
 ###########################################
 # DÉMARRAGE AUTOMATIQUE AU BOOT
 ###########################################
@@ -2679,133 +2863,33 @@ cmd_migrate_sessions() {
 }
 
 ###########################################
-# EMPLACEMENT DES SESSIONS (VM ⇄ NAS)
+# DISQUE SSD TEMPORAIRE — bascule interactive
 ###########################################
-# Politique globale : la session rtorrent vit soit sur le disque local de
-# la VM (rapide, valeur par défaut dès que le volume /local existe), soit
-# sur le NAS via RT_SESSION_NFS=yes dans l'env du compose (survit à la
-# perte de la VM). Le déplacement des fichiers de session est fait par
-# l'entrypoint au démarrage suivant, avec sauvegardes horodatées.
-
-cmd_session_nas() {
-    print_header_with_title "SESSIONS RTORRENT SUR LE NAS"
-
-    echo -e "  ${DIM}La session (liste des torrents, état des seeds) sera stockée sur le${NC}"
-    echo -e "  ${DIM}NAS : docker_apps/rtorrent/.session — elle survit à la perte de la VM.${NC}"
-    echo -e "  ${DIM}Les logs restent sur le disque local. Au redémarrage suivant, chaque${NC}"
-    echo -e "  ${DIM}conteneur rapatrie automatiquement sa session (sauvegardes conservées).${NC}"
-    echo ""
-    echo -e "  ${YELLOW}Prérequis : image reconstruite après mise à jour (menu 3), puis${NC}"
-    echo -e "  ${YELLOW}redémarrage des clients après cette opération.${NC}"
-    echo ""
-
-    read -p "  Continuer ? [o/N] " confirm
-    if [ "$confirm" != "o" ] && [ "$confirm" != "O" ]; then
-        echo ""
-        echo -e "  ${DIM}Annulé${NC}"
-        print_footer
-        return
-    fi
-
-    echo ""
-    local count=0
-    for CLIENT in $(get_clients); do
-        local compose_file="$CLIENTS_DIR/$CLIENT/docker-compose.yml"
-        [ -f "$compose_file" ] || continue
-        if grep -q "RT_SESSION_NFS=yes" "$compose_file"; then
-            echo -e "  ${DIM}-${NC} $CLIENT ${DIM}(déjà sur le NAS)${NC}"
-        else
-            cp "$compose_file" "${compose_file}.bak-$(date +%Y%m%d%H%M%S)"
-            sed -i "\|- RT_PORT=|a\\      - RT_SESSION_NFS=yes" "$compose_file"
-            if grep -q "RT_SESSION_NFS=yes" "$compose_file"; then
-                echo -e "  ${GREEN}✔${NC} $CLIENT"
-            else
-                echo -e "  ${RED}✗${NC} $CLIENT ${DIM}(insertion échouée)${NC}"
-            fi
-        fi
-        count=$((count + 1))
-    done
-
-    SESSION_NAS="yes"
-    save_config || echo -e "  ${RED}✗ Impossible d'écrire ${CONFIG_FILE}${NC}"
-
-    echo ""
-    if [ "$count" -eq 0 ]; then
-        echo -e "  ${DIM}Aucun client trouvé — la politique s'appliquera aux futurs clients.${NC}"
-    else
-        echo -e "  ${WHITE}Étape suivante :${NC} redémarrer les clients (menu Maintenance → 4)."
-        echo -e "  ${DIM}Le rapatriement de la session est automatique au démarrage.${NC}"
-    fi
-    print_footer
-}
-
-cmd_session_local() {
-    print_header_with_title "SESSIONS RTORRENT SUR LE DISQUE LOCAL"
-
-    echo -e "  ${DIM}La session revient sur le disque local de la VM (plus rapide : la${NC}"
-    echo -e "  ${DIM}sauvegarde périodique ne martèle plus le NFS). L'entrypoint recopie${NC}"
-    echo -e "  ${DIM}la session du NAS au redémarrage suivant.${NC}"
-    echo ""
-
-    read -p "  Continuer ? [o/N] " confirm
-    if [ "$confirm" != "o" ] && [ "$confirm" != "O" ]; then
-        echo ""
-        echo -e "  ${DIM}Annulé${NC}"
-        print_footer
-        return
-    fi
-
-    echo ""
-    local count=0
-    for CLIENT in $(get_clients); do
-        local compose_file="$CLIENTS_DIR/$CLIENT/docker-compose.yml"
-        [ -f "$compose_file" ] || continue
-        # S'assurer que le volume /local existe (clients d'avant la v3.1.0)
-        migrate_client_session "$CLIENT" >/dev/null 2>&1 || true
-        if grep -q "RT_SESSION_NFS=" "$compose_file"; then
-            cp "$compose_file" "${compose_file}.bak-$(date +%Y%m%d%H%M%S)"
-            sed -i "\|RT_SESSION_NFS=|d" "$compose_file"
-            echo -e "  ${GREEN}✔${NC} $CLIENT"
-        else
-            echo -e "  ${DIM}-${NC} $CLIENT ${DIM}(déjà en local)${NC}"
-        fi
-        count=$((count + 1))
-    done
-
-    SESSION_NAS="no"
-    save_config || echo -e "  ${RED}✗ Impossible d'écrire ${CONFIG_FILE}${NC}"
-
-    echo ""
-    if [ "$count" -eq 0 ]; then
-        echo -e "  ${DIM}Aucun client trouvé — la politique s'appliquera aux futurs clients.${NC}"
-    else
-        echo -e "  ${WHITE}Étape suivante :${NC} redémarrer les clients (menu Maintenance → 4)."
-    fi
-    print_footer
-}
-
-interactive_session_location() {
+# La session rtorrent vit TOUJOURS sur le NAS (voir entrypoint) : plus de
+# choix d'emplacement. Ce petit menu active ou desactive le disque SSD
+# temporaire pour les clients.
+interactive_temp_toggle() {
     print_menu_header
 
-    echo -e "  ${WHITE}EMPLACEMENT DES SESSIONS RTORRENT${NC}"
+    echo -e "  ${WHITE}DISQUE SSD TEMPORAIRE${NC}"
     line
     echo ""
-    if [ "$SESSION_NAS" = "yes" ]; then
-        echo -e "  Politique actuelle : ${CYAN}NAS${NC} ${DIM}(docker_apps/rtorrent/.session — survit à la VM)${NC}"
+    if [ -n "$TEMP_DIR" ]; then
+        echo -e "  Dossier SSD configuré : ${CYAN}${TEMP_DIR}${NC}"
     else
-        echo -e "  Politique actuelle : ${CYAN}disque local de la VM${NC} ${DIM}(rapide, hors NFS)${NC}"
+        echo -e "  ${DIM}Aucun dossier SSD configuré (menu « Configurer le réseau »).${NC}"
     fi
     echo ""
-    print_menu_option "1" "-" "Disque local de la VM ${DIM}(performances : session hors NFS)${NC}"
-    print_menu_option "2" "-" "NAS ${DIM}(sécurité : la session survit à la perte de la VM)${NC}"
+    print_menu_option "1" "-" "Activer  ${DIM}(télécharger sur le SSD puis déplacer vers le NAS)${NC}"
+    print_menu_option "2" "-" "Désactiver  ${DIM}(télécharger directement sur le NAS)${NC}"
     print_menu_separator
     print_menu_option "0" "-" "Retour"
 
     read_choice "Votre choix" ""
 
     case $MENU_CHOICE in
-        1) cmd_session_local; press_enter ;;
-        2) cmd_session_nas; press_enter ;;
+        1) cmd_temp_enable; press_enter ;;
+        2) cmd_temp_disable; press_enter ;;
         *) ;;
     esac
 }
@@ -3316,6 +3400,22 @@ cmd_config_network() {
         echo -e "  ${YELLOW}⚠ ${input_temp_dir} n'existe pas encore (monte le SSD dessus) — enregistré quand même.${NC}"
     fi
 
+    # Taille maximale d'un torrent (garde-fou), saisie en To
+    echo ""
+    local cur_size_to
+    cur_size_to=$(awk -v b="${MAX_TORRENT_SIZE:-0}" 'BEGIN{ if(b+0==0) print 0; else printf "%.0f", b/1099511627776 }')
+    echo -e "  ${DIM}Taille maximale d'un torrent accepté à l'ajout (garde-fou).${NC}"
+    echo -ne "  Taille max en To [${cur_size_to}] (0 = illimité) : "
+    read input_max_to
+    local input_max_size="${MAX_TORRENT_SIZE:-0}"
+    if [ -n "$input_max_to" ]; then
+        case "$input_max_to" in
+            0) input_max_size="0" ;;
+            *[!0-9]*) echo -e "  ${YELLOW}⚠ Valeur ignorée (nombre entier de To attendu).${NC}" ;;
+            *) input_max_size=$((input_max_to * 1099511627776)) ;;
+        esac
+    fi
+
     echo ""
     echo -e "  ${WHITE}Résumé des modifications :${NC}"
     line
@@ -3345,9 +3445,18 @@ cmd_config_network() {
     fi
 
     if [ "$input_temp_dir" != "$TEMP_DIR" ]; then
-        print_item_last "Disque SSD temp." "${TEMP_DIR:-désactivé} → ${input_temp_dir:-désactivé}"
+        print_item "Disque SSD temp." "${TEMP_DIR:-désactivé} → ${input_temp_dir:-désactivé}"
     else
-        print_item_last "Disque SSD temp." "${TEMP_DIR:-désactivé} (inchangé)"
+        print_item "Disque SSD temp." "${TEMP_DIR:-désactivé} (inchangé)"
+    fi
+
+    local old_size_h new_size_h
+    old_size_h=$(awk -v b="${MAX_TORRENT_SIZE:-0}" 'BEGIN{ if(b+0==0) print "illimité"; else printf "%.0f To", b/1099511627776 }')
+    new_size_h=$(awk -v b="${input_max_size:-0}" 'BEGIN{ if(b+0==0) print "illimité"; else printf "%.0f To", b/1099511627776 }')
+    if [ "$input_max_size" != "${MAX_TORRENT_SIZE:-0}" ]; then
+        print_item_last "Taille max torrent" "${old_size_h} → ${new_size_h}"
+    else
+        print_item_last "Taille max torrent" "${old_size_h} (inchangé)"
     fi
 
     echo ""
@@ -3361,6 +3470,7 @@ cmd_config_network() {
     [ -n "$input_ssh_port" ] && [ "$SSH_PORT" != "$input_ssh_port" ] && config_changed=1
     [ -n "$input_nas_ip" ] && [ "$NAS_IP" != "$input_nas_ip" ] && config_changed=1
     [ "$input_temp_dir" != "$TEMP_DIR" ] && config_changed=1
+    [ "$input_max_size" != "${MAX_TORRENT_SIZE:-0}" ] && config_changed=1
 
     if [ $changes_made -eq 0 ] && [ $config_changed -eq 0 ]; then
         echo -e "  ${DIM}Aucune modification à appliquer.${NC}"
@@ -3393,10 +3503,12 @@ cmd_config_network() {
     # dans laboboxvpn.conf même quand le système, lui, n'a rien à changer.
     local old_nas_ip="$NAS_IP"
     local old_temp_dir="$TEMP_DIR"
+    local old_max_size="${MAX_TORRENT_SIZE:-0}"
     [ -n "$input_server_ip" ] && SERVER_IP="$input_server_ip"
     [ -n "$input_ssh_port" ] && SSH_PORT="$input_ssh_port"
     [ -n "$input_nas_ip" ] && NAS_IP="$input_nas_ip"
     TEMP_DIR="$input_temp_dir"
+    MAX_TORRENT_SIZE="$input_max_size"
 
     # 1. Modifier l'IP dans /etc/network/interfaces
     if [ "$input_server_ip" != "$current_ip" ] && [ -n "$input_server_ip" ]; then
@@ -3445,7 +3557,24 @@ cmd_config_network() {
             echo -e "  ${GREEN}✔ Disque SSD temporaire désactivé pour les futurs clients${NC}"
         fi
     fi
-    
+
+    # 5. Taille max des torrents — propagée aux compose des clients existants
+    if [ "$MAX_TORRENT_SIZE" != "$old_max_size" ]; then
+        local _c _cf _n=0
+        for _c in $(get_clients); do
+            _cf="$CLIENTS_DIR/$_c/docker-compose.yml"
+            [ -f "$_cf" ] || continue
+            if grep -q "RT_MAX_TORRENT_SIZE=" "$_cf"; then
+                sed -i "s|      - RT_MAX_TORRENT_SIZE=.*|      - RT_MAX_TORRENT_SIZE=${MAX_TORRENT_SIZE}|" "$_cf"
+            else
+                sed -i "\|- RU_DISABLED_PLUGINS=|a\\      - RT_MAX_TORRENT_SIZE=${MAX_TORRENT_SIZE}" "$_cf"
+            fi
+            _n=$((_n + 1))
+        done
+        echo -e "  ${GREEN}✔ Taille max des torrents : ${new_size_h}${NC}"
+        [ "$_n" -gt 0 ] && echo -e "  ${DIM}  Appliquée à ${_n} client(s) — redémarre-les pour l'activer.${NC}"
+    fi
+
     # Sauvegarder la configuration
     if save_config; then
         echo -e "  ${GREEN}✔ Configuration sauvegardée dans ${CONFIG_FILE}${NC}"
@@ -3678,10 +3807,9 @@ cmd_help() {
     echo -e "  ${WHITE}optimize-status${NC}   Voir les paramètres actifs"
     echo -e "  ${WHITE}optimize-restore${NC}  Restaurer les valeurs d'origine"
     echo -e "  ${WHITE}migrate-sessions${NC}  Ajouter le volume /local aux anciens clients"
-    echo -e "  ${WHITE}session-local${NC}     Sessions rtorrent sur le disque de la VM (rapide)"
-    echo -e "  ${WHITE}session-nas${NC}       Sessions rtorrent sur le NAS (survit à la VM)"
     echo -e "  ${WHITE}temp-enable${NC}       Téléchargements sur disque SSD temporaire [client]"
     echo -e "  ${WHITE}temp-disable${NC}      Revenir aux téléchargements directs NAS [client]"
+    echo -e "  ${WHITE}bench${NC}             Benchmark complet 4 voies (NFS/SSD × direct/VPN) <client>"
     echo -e "  ${WHITE}bench-nfs${NC}         Benchmark écriture/lecture NAS <client> [mo]"
     echo -e "  ${WHITE}bench-vpn${NC}         Benchmark débit du tunnel VPN <client>"
     echo ""
@@ -4806,24 +4934,39 @@ interactive_bench_menu() {
         echo -e "  ${WHITE}BENCHMARKS${NC}"
         line
         echo ""
-        echo -e "  ${DIM}Mesures réelles pour valider les réglages : écriture/lecture sur le${NC}"
-        echo -e "  ${DIM}NAS (writeback), et débit à travers le tunnel VPN d'un client.${NC}"
+        echo -e "  ${DIM}Mesures réelles pour valider les réglages. Le « complet » couvre les${NC}"
+        echo -e "  ${DIM}4 voies : disque NAS et disque SSD en direct, puis téléchargement à${NC}"
+        echo -e "  ${DIM}travers le tunnel VPN écrit sur le NAS puis sur le SSD.${NC}"
         echo ""
 
-        print_menu_option "1" "-" "Écriture / lecture NFS (partage d'un client)"
-        print_menu_option "2" "-" "Débit VPN d'un client (vs direct)"
+        print_menu_option "1" "-" "Benchmark complet 4 voies (NFS/SSD × direct/VPN)"
+        print_menu_option "2" "-" "Écriture / lecture NFS seule (partage d'un client)"
+        print_menu_option "3" "-" "Débit VPN seul (vs direct, vers /dev/null)"
         print_menu_separator
         print_menu_option "0" "-" "Retour"
 
         read_choice "Votre choix" ""
 
+        local clients bench_client bench_size
         case $MENU_CHOICE in
             1)
-                local clients=$(get_clients)
+                clients=$(get_clients)
                 if [ -z "$clients" ]; then
-                    echo -e "  ${DIM}Aucun client configuré.${NC}"
-                    press_enter
-                    continue
+                    echo -e "  ${DIM}Aucun client configuré.${NC}"; press_enter; continue
+                fi
+                echo ""
+                echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
+                echo ""
+                echo -ne "  Nom du client : "
+                read bench_client
+                [ -z "$bench_client" ] && continue
+                cmd_bench_all "$bench_client"
+                press_enter
+                ;;
+            2)
+                clients=$(get_clients)
+                if [ -z "$clients" ]; then
+                    echo -e "  ${DIM}Aucun client configuré.${NC}"; press_enter; continue
                 fi
                 echo ""
                 echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
@@ -4836,12 +4979,10 @@ interactive_bench_menu() {
                 cmd_bench_nfs "$bench_client" "${bench_size:-512}"
                 press_enter
                 ;;
-            2)
-                local clients=$(get_clients)
+            3)
+                clients=$(get_clients)
                 if [ -z "$clients" ]; then
-                    echo -e "  ${DIM}Aucun client configuré.${NC}"
-                    press_enter
-                    continue
+                    echo -e "  ${DIM}Aucun client configuré.${NC}"; press_enter; continue
                 fi
                 echo ""
                 echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
@@ -6117,11 +6258,10 @@ interactive_maintenance_menu() {
 
         print_menu_option "9" "-" "Monter tous les partages NAS"
         print_menu_option "10" "-" "Optimisation réseau & stockage NFS"
-        print_menu_option "11" "-" "Emplacement des sessions rtorrent (VM locale ⇄ NAS)"
-        print_menu_option "12" "-" "Activer le disque SSD temporaire (téléchargements)"
-        print_menu_option "13" "-" "$(echo -e "$autostart_label")"
+        print_menu_option "11" "-" "Activer / Désactiver le disque SSD temporaire"
+        print_menu_option "12" "-" "$(echo -e "$autostart_label")"
         print_menu_separator
-        print_menu_option "14" "-" "Désinstaller tout"
+        print_menu_option "13" "-" "Désinstaller tout"
         print_menu_separator
         print_menu_option "0" "-" "Retour"
 
@@ -6156,9 +6296,8 @@ interactive_maintenance_menu() {
             8) cmd_sequential_stop; press_enter ;;
             9) cmd_mount; press_enter ;;
             10) interactive_network_optimize_menu ;;
-            11) interactive_session_location ;;
-            12) cmd_temp_enable; press_enter ;;
-            13)
+            11) interactive_temp_toggle ;;
+            12)
                 if is_autostart_enabled; then
                     cmd_autostart_disable
                 else
@@ -6166,7 +6305,7 @@ interactive_maintenance_menu() {
                 fi
                 press_enter
                 ;;
-            14) cmd_uninstall; press_enter ;;
+            13) cmd_uninstall; press_enter ;;
             0|q|Q) return ;;
             *) ;;
         esac
@@ -6370,16 +6509,15 @@ case "${1}" in
     migrate-sessions)
         cmd_migrate_sessions
         ;;
-    session-nas)
-        cmd_session_nas
-        ;;
-    session-local)
-        cmd_session_local
-        ;;
     check-ports)
         shift
         parse_args "$@"
         cmd_check_ports "${ARG_USER:-${OTHER_ARGS[0]:-}}"
+        ;;
+    bench)
+        shift
+        parse_args "$@"
+        cmd_bench_all "${ARG_USER:-${OTHER_ARGS[0]:-}}"
         ;;
     bench-nfs)
         shift

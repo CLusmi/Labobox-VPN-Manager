@@ -1,11 +1,12 @@
 #!/bin/bash
 ###############################################
-# ENTRYPOINT - rtorrent + ruTorrent v3.2.0    #
+# ENTRYPOINT - rtorrent + ruTorrent v3.3.0    #
 # Genere les configs depuis les variables ENV #
 # LaboBox-VPN - 2026                          #
 #                                             #
-# v3.2.0 : ruTorrent 5.3.13 + php simplexml   #
-#          (rtorrent reste en 0.16.5, stable) #
+# v3.3.0 : SSD miroir categorie + garde-fou   #
+#          taille, profil download agressif   #
+# v3.2.0 : ruTorrent 5.2.10, php simplexml    #
 # v3.1.0 : optimisation stockage NFS          #
 #  - session + logs hors NFS (si volume local)#
 #  - chmod recursifs supprimes (storm NFS)    #
@@ -17,7 +18,7 @@
 set -e
 
 echo "================================================"
-echo "  RTORRENT + RUTORRENT v3.2.0 - laboboxvpn"
+echo "  RTORRENT + RUTORRENT v3.3.0 - laboboxvpn"
 echo "================================================"
 
 ###########################################
@@ -51,16 +52,30 @@ RT_MAX_OPEN_FILES="${RT_MAX_OPEN_FILES:-3072}"
 RT_MAX_OPEN_SOCKETS="${RT_MAX_OPEN_SOCKETS:-900}"
 
 # --- Peers (par torrent) ---
-RT_MIN_PEERS="${RT_MIN_PEERS:-10}"
-RT_MAX_PEERS="${RT_MAX_PEERS:-40}"
-RT_MIN_PEERS_SEED="${RT_MIN_PEERS_SEED:-0}"
-RT_MAX_PEERS_SEED="${RT_MAX_PEERS_SEED:-10}"
+# Deux profils distincts :
+#  * NORMAL (torrent EN TELECHARGEMENT) : les ecritures vont sur le SSD, on
+#    peut donc lacher les chevaux pour saturer la connexion (beaucoup de peers).
+#  * SEED (torrent TERMINE) : les lectures se font sur le NAS (disques
+#    mecaniques). Genereux mais borne, pour ne pas noyer l'array en lectures
+#    aleatoires. C'etait tout l'interet du disque temporaire.
+RT_MIN_PEERS="${RT_MIN_PEERS:-20}"
+RT_MAX_PEERS="${RT_MAX_PEERS:-100}"
+RT_MIN_PEERS_SEED="${RT_MIN_PEERS_SEED:-5}"
+RT_MAX_PEERS_SEED="${RT_MAX_PEERS_SEED:-50}"
 
-# --- Slots (= flux d'IO reels sur l'array) ---
-RT_MAX_UPLOADS_GLOBAL="${RT_MAX_UPLOADS_GLOBAL:-100}"
-RT_MAX_DOWNLOADS_GLOBAL="${RT_MAX_DOWNLOADS_GLOBAL:-100}"
-RT_MAX_UPLOADS="${RT_MAX_UPLOADS:-4}"
-RT_MAX_DOWNLOADS="${RT_MAX_DOWNLOADS:-8}"
+# --- Slots (= flux d'IO simultanes) ---
+# En download c'est du SSD (rapide) : on ouvre grand. Les uploads restent
+# raisonnables par torrent (le seed lit sur le NAS).
+RT_MAX_UPLOADS_GLOBAL="${RT_MAX_UPLOADS_GLOBAL:-250}"
+RT_MAX_DOWNLOADS_GLOBAL="${RT_MAX_DOWNLOADS_GLOBAL:-250}"
+RT_MAX_UPLOADS="${RT_MAX_UPLOADS:-8}"
+RT_MAX_DOWNLOADS="${RT_MAX_DOWNLOADS:-16}"
+
+# --- Taille max d'un torrent accepte (garde-fou) ---
+# Un torrent dont la taille totale depasse cette valeur est refuse a l'ajout
+# (stoppe + efface, journalise). 6 To par defaut. 0 = aucune limite.
+# En octets ; 6 To = 6 * 1024^4.
+RT_MAX_TORRENT_SIZE="${RT_MAX_TORRENT_SIZE:-6597069766656}"
 
 # --- Bande passante (0 = illimite, en KiB/s) ---
 RT_DOWN_RATE="${RT_DOWN_RATE:-0}"
@@ -128,18 +143,15 @@ fi
 ###########################################
 # rtorrent est MONOTHREAD : toute operation disque bloquante gele le client
 # entier, downloads compris. La sauvegarde de session reecrit un fichier par
-# torrent modifie ; sur NFS avec plusieurs centaines de torrents, c'est
-# plusieurs secondes de gel a chaque cycle.
+# torrent modifie.
 #
-# Par defaut, si un volume local est monte sur /local, session et logs y
-# vivent. RT_SESSION_NFS=yes (env du compose, commande session-nas du
-# manager) force la session sur le NAS (/config/rtorrent/.session) : elle
-# survit alors a la perte de la VM. Les logs, sans valeur pour les seeds,
-# restent sur /local quand il est disponible.
+# POLITIQUE : la session (liste des torrents, etat des seeds) vit TOUJOURS
+# sur le NAS (/config/rtorrent/.session). Elle survit ainsi a la perte de la
+# VM : en cas de crash, on repart sur une autre VM sans rien perdre. Les logs,
+# sans valeur pour les seeds, restent sur le disque local (/local) quand il
+# existe, pour ne pas bavarder inutilement sur le NFS.
 
-echo "> Emplacement de la session rtorrent..."
-
-RT_SESSION_NFS="${RT_SESSION_NFS:-no}"
+echo "> Emplacement de la session rtorrent (NAS)..."
 
 if grep -q " /local " /proc/mounts 2>/dev/null; then
     LOCAL_MOUNTED="yes"
@@ -149,44 +161,21 @@ else
     LOG_PATH="/config/rtorrent/log"
 fi
 
-if [ "$RT_SESSION_NFS" = "yes" ]; then
-    SESSION_PATH="/config/rtorrent/.session"
-    echo "  [OK] RT_SESSION_NFS=yes -> session sur le NAS (survit a la perte de la VM)"
-    [ "$LOCAL_MOUNTED" = "yes" ] && echo "       logs sur le volume local"
-elif [ "$LOCAL_MOUNTED" = "yes" ]; then
-    SESSION_PATH="/local/session"
-    echo "  [OK] Volume local detecte -> session et logs hors NFS"
-else
-    SESSION_PATH="/config/rtorrent/.session"
-    echo "  [!] Pas de volume monte sur /local : session et logs restent sur NFS."
-    echo "      C'est la premiere cause de ralentissement avec beaucoup de torrents."
-fi
+SESSION_PATH="/config/rtorrent/.session"
+echo "  [OK] session sur le NAS ${SESSION_PATH}"
+[ "$LOCAL_MOUNTED" = "yes" ] && echo "       logs sur le volume local (${LOG_PATH})"
 
 mkdir -p "$SESSION_PATH"
 mkdir -p "$LOG_PATH"
 
-# Migration one-shot vers /local : si on vient de basculer et que l'ancienne
-# session NFS contient des donnees, on les recupere (sinon tous les torrents
-# disparaissent de l'interface).
-if [ "$SESSION_PATH" = "/local/session" ]; then
-    if [ -z "$(ls -A "$SESSION_PATH" 2>/dev/null)" ] && \
-       [ -n "$(ls -A /config/rtorrent/.session 2>/dev/null)" ]; then
-        echo "  -> Migration de la session NFS vers le volume local..."
-        cp -a /config/rtorrent/.session/. "$SESSION_PATH"/ 2>/dev/null || true
-        echo "     [OK] $(ls -1 "$SESSION_PATH" | wc -l) fichiers migres"
-    fi
-fi
-
-# Migration one-shot retour vers le NAS : la session VIVANTE est celle de
-# /local/session ; l'ancienne session NFS (laissee en place par la migration
-# aller) est PERIMEE et ne doit jamais etre rechargee telle quelle — elle
-# ressusciterait une vieille liste de torrents. On l'ecarte, on copie la
-# session vivante, puis on ecarte la copie locale pour ne pas re-declencher.
-# Rien n'est supprime : tout reste en sauvegarde horodatee.
-if [ "$SESSION_PATH" = "/config/rtorrent/.session" ] && \
-   [ -n "$(ls -A /local/session 2>/dev/null)" ]; then
+# Migration one-shot : un client qui avait sa session sur le disque local
+# (ancienne politique) la voit rapatriee sur le NAS au demarrage. La session
+# VIVANTE est celle de /local/session ; une eventuelle ancienne session NFS
+# est PERIMEE (elle ressusciterait une vieille liste de torrents) : on
+# l'ecarte au lieu de la melanger. Rien n'est supprime, tout est horodate.
+if [ -n "$(ls -A /local/session 2>/dev/null)" ]; then
     STAMP=$(date +%Y%m%d%H%M%S)
-    echo "  -> Retour de la session locale vers le NAS..."
+    echo "  -> Rapatriement de la session locale vers le NAS..."
     if [ -n "$(ls -A "$SESSION_PATH" 2>/dev/null)" ]; then
         mv "$SESSION_PATH" "${SESSION_PATH}.perimee-${STAMP}"
         echo "     ancienne session NFS ecartee : .session.perimee-${STAMP}"
@@ -194,19 +183,19 @@ if [ "$SESSION_PATH" = "/config/rtorrent/.session" ] && \
     mkdir -p "$SESSION_PATH"
     cp -a /local/session/. "$SESSION_PATH"/
     chown -R rtorrent:rtorrent "$SESSION_PATH" 2>/dev/null || true
-    mv /local/session "/local/session.retour-nas-${STAMP}"
-    echo "     [OK] $(ls -1 "$SESSION_PATH" | wc -l) fichiers rapatries sur le NAS"
-    echo "          copie locale conservee : /local/session.retour-nas-${STAMP}"
+    mv /local/session "/local/session.rapatriee-${STAMP}"
+    echo "     [OK] $(ls -1 "$SESSION_PATH" | wc -l) fichiers sur le NAS (copie locale conservee)"
 fi
 
 ###########################################
 # DISQUE TEMPORAIRE (SSD) POUR LES TELECHARGEMENTS
 ###########################################
 # Si un volume est monte sur /temp (SSD local de la VM), chaque nouveau
-# torrent est telecharge dans /temp/incomplet (ecritures aleatoires
-# absorbees par le SSD, NAS au repos) puis DEPLACE a la completion vers la
+# torrent est telecharge sur le SSD dans un sous-dossier qui REFLETE sa
+# categorie (/data/torrents/films -> /temp/films) — ecritures aleatoires
+# absorbees par le SSD, NAS au repos — puis DEPLACE a la completion vers la
 # destination que l'utilisateur a choisie a l'ajout (repertoire de la
-# fenetre ruTorrent ou dossier watch) — memorisee dans le custom
+# fenetre ruTorrent ou dossier watch), memorisee dans le custom
 # "labobox_dest" par l'interception inserted_new.
 #
 # rtorrent etant MONOTHREAD, le deplacement ne se fait JAMAIS en synchrone
@@ -245,7 +234,9 @@ mkdir -p /run/nginx
 mkdir -p /run/php
 
 if [ "$TEMP_ENABLED" = "yes" ]; then
-    mkdir -p /temp/incomplet
+    # Les sous-dossiers SSD par categorie (/temp/films, /temp/series, ...)
+    # sont crees a la volee par labobox-ssdpath au moment de l'ajout.
+    mkdir -p /temp
 fi
 
 ###########################################
@@ -256,11 +247,11 @@ echo "> Generation de rtorrent.rc..."
 # L'utilisateur choisit toujours sa destination FINALE (repertoire de la
 # fenetre d'ajout ruTorrent, ou dossier watch). Quand le disque temporaire
 # est actif, cette destination est memorisee a l'ajout et le telechargement
-# est redirige vers /temp/incomplet ; le deplacement se fait a la
+# est redirige vers le SSD (miroir categorie) ; le deplacement se fait a la
 # completion (voir le bloc DISQUE TEMPORAIRE plus bas). Sans /temp, le
 # telechargement va directement dans la destination : memes chemins,
 # memes dossiers watch dans les deux modes.
-RT_DEFAULT_DIR="/data/torrents/autres"
+RT_DEFAULT_DIR="/data/torrents"
 
 cat > /tmp/rtorrent.rc << EOF
 ##############################################
@@ -321,8 +312,9 @@ throttle.max_peers.normal.set = ${RT_MAX_PEERS}
 throttle.min_peers.seed.set = ${RT_MIN_PEERS_SEED}
 throttle.max_peers.seed.set = ${RT_MAX_PEERS_SEED}
 
-# Nombre de peers demandes au tracker a chaque annonce.
-trackers.numwant.set = 50
+# Nombre de peers demandes au tracker a chaque annonce (profil agressif :
+# le SSD encaisse le download, on va chercher large).
+trackers.numwant.set = 100
 
 ##############################################
 # SLOTS = FLUX D'IO SIMULTANES
@@ -365,8 +357,8 @@ pieces.sync.always_safe.set = no
 
 # Buffers socket : c'est de la memoire NOYAU, multipliee par le nombre de
 # peers. Avec des peers reduits, 2M/4M est confortable pour du 10 GbE.
-network.receive_buffer.size.set = 2M
-network.send_buffer.size.set = 4M
+network.receive_buffer.size.set = 4M
+network.send_buffer.size.set = 8M
 
 network.xmlrpc.size_limit.set = 16777216
 network.http.ssl_verify_peer.set = 0
@@ -411,23 +403,30 @@ EOF
 # Disque temporaire : interception a l'ajout + deplacement a la completion.
 # Heredoc QUOTE : les $d.* sont des variables rtorrent, pas bash.
 #
-# A l'ajout (inserted_new : jamais au rechargement de session), le
-# repertoire choisi par l'utilisateur est memorise (custom "labobox_dest")
-# puis remplace par /temp/incomplet : l'utilisateur choisit sa destination
-# FINALE comme il l'a toujours fait, le SSD s'intercale tout seul.
+# A l'ajout (inserted_new : jamais au rechargement de session) :
+#  - garde-fou : un torrent plus gros que la limite est refuse (labobox-guard) ;
+#  - la destination FINALE choisie par l'utilisateur est memorisee
+#    (custom "labobox_dest") ;
+#  - le download est redirige vers le SSD en REFLETANT la categorie :
+#    /data/torrents/films -> /temp/films (calcule par labobox-ssdpath).
+#    L'utilisateur choisit sa destination finale comme toujours, le SSD
+#    s'intercale et reste lisible par categorie.
 #
 # A la completion, le torrent est stoppe puis FERME (d.close libere les
 # fichiers, requis pour changer son repertoire), et le gros du travail part
 # en ARRIERE-PLAN via execute.throw.bg : rtorrent (monothread) ne gele
-# jamais pendant la copie.
+# jamais pendant la copie. Le seed depuis le SSD continue PENDANT le
+# download (natif BitTorrent) ; apres deplacement il seede depuis le NAS.
 if [ "$TEMP_ENABLED" = "yes" ]; then
 cat >> /tmp/rtorrent.rc << 'TEMPEOF'
 
 ##############################################
 # DISQUE TEMPORAIRE : SSD PUIS DEPLACEMENT
 ##############################################
-# Memorise la destination choisie, redirige le telechargement vers le SSD.
-method.set_key = event.download.inserted_new, labobox_grab, "d.custom.set=labobox_dest,(d.directory) ; d.directory.set=/temp/incomplet"
+# Garde-fou taille (refuse a l'ajout un torrent trop gros).
+method.set_key = event.download.inserted_new, labobox_guard, "execute.throw.bg=/usr/local/bin/labobox-guard,$d.hash=,$d.size_bytes="
+# Memorise la destination finale, redirige le download vers le SSD (miroir categorie).
+method.set_key = event.download.inserted_new, labobox_grab, "d.custom.set=labobox_dest,(d.directory) ; d.directory.set=(execute.capture,/usr/local/bin/labobox-ssdpath,(d.directory))"
 # d.data_path : dossier du torrent (multi-fichiers) ou fichier (mono).
 method.insert = d.data_path, simple, "if=(d.is_multi_file), (cat,(d.directory)), (cat,(d.directory),/,(d.name))"
 method.set_key = event.download.finished, labobox_move, "d.stop= ; d.close= ; execute.throw.bg=/usr/local/bin/labobox-mover,$d.hash=,$d.data_path=,$d.custom=labobox_dest"
@@ -496,6 +495,46 @@ exit(0);
 XMLRPCEOF
     chmod 755 /usr/local/bin/labobox-xmlrpc
 
+    # Calcul du chemin SSD miroir : /data/torrents/films -> /temp/films.
+    # Appele SYNCHRONE par rtorrent a l'ajout (execute.capture) : imprime le
+    # chemin et cree le dossier a la volee. Toujours un chemin valide en sortie.
+    cat > /usr/local/bin/labobox-ssdpath << 'SSDPATHEOF'
+#!/bin/bash
+# labobox-ssdpath <destination_finale>  ->  imprime le chemin SSD miroir
+DEST="${1%/}"
+case "$DEST" in
+    /data/torrents/*) SSD="/temp/${DEST#/data/torrents/}" ;;
+    /data/torrents)   SSD="/temp" ;;
+    /data/*)          SSD="/temp/${DEST#/data/}" ;;
+    *)                SSD="/temp/autres" ;;
+esac
+mkdir -p "$SSD" 2>/dev/null
+printf '%s' "$SSD"
+SSDPATHEOF
+    chmod 755 /usr/local/bin/labobox-ssdpath
+
+    # Garde-fou taille : lance en arriere-plan a l'ajout. Refuse (close+erase)
+    # un torrent dont la taille totale depasse la limite. La limite est gelee
+    # ici depuis RT_MAX_TORRENT_SIZE (0 = desactive).
+    cat > /usr/local/bin/labobox-guard << GUARDEOF
+#!/bin/bash
+# labobox-guard <hash> <taille_octets>
+HASH="\$1"
+SIZE="\$2"
+LIMIT="${RT_MAX_TORRENT_SIZE:-0}"
+LOG="${LOG_PATH}/mover.log"
+[ "\$LIMIT" = "0" ] && exit 0
+# SIZE=0 : magnet sans metadata encore -> on ne bloque pas a ce stade.
+[ "\$SIZE" -gt 0 ] 2>/dev/null || exit 0
+if [ "\$SIZE" -gt "\$LIMIT" ] 2>/dev/null; then
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') [\$HASH] REFUSE: \$SIZE octets > limite \$LIMIT" >> "\$LOG"
+    /usr/local/bin/labobox-xmlrpc d.close "\$HASH" 2>>"\$LOG"
+    /usr/local/bin/labobox-xmlrpc d.erase "\$HASH" 2>>"\$LOG"
+fi
+exit 0
+GUARDEOF
+    chmod 755 /usr/local/bin/labobox-guard
+
     # Deplaceur : lance en arriere-plan par rtorrent a chaque completion.
     # Le torrent arrive stoppe et ferme. Copie SSD -> NAS (sequentiel, le
     # cas ideal du NAS), re-pointe le torrent, relance le seed, nettoie.
@@ -554,7 +593,7 @@ exit 0
 MOVEREOF
     chmod 755 /usr/local/bin/labobox-mover
 
-    echo "  [OK] labobox-mover + labobox-xmlrpc installes"
+    echo "  [OK] scripts installes : mover, xmlrpc, ssdpath, guard"
 fi
 
 ###########################################
@@ -633,6 +672,18 @@ sed -i "s|LOG_PATH_PLACEHOLDER|${LOG_PATH}|g" /var/www/rutorrent/conf/config.php
 
 mkdir -p "/config/rutorrent/users/${RU_USER}/torrents"
 mkdir -p "/config/rutorrent/users/${RU_USER}/settings"
+
+###########################################
+# PATCH RUTORRENT POUR RTORRENT 0.16.x (i8/to_kb)
+###########################################
+# ruTorrent 5.2.10 envoie to_kb avec un seul argument, refuse par rtorrent
+# compile avec le support i8 (entiers 64 bits). Le sed corrige la signature.
+# (Devenu inutile en ruTorrent 5.3.x, mais on est en 5.2.10.) Sans effet si
+# la ligne n'existe pas : pas d'echec.
+if [ -f /var/www/rutorrent/php/settings.php ]; then
+    sed -i 's/new rXMLRPCCommand("to_kb", floatval(1024))/new rXMLRPCCommand("to_kb", array("", floatval(1024)))/' /var/www/rutorrent/php/settings.php
+    echo "> Patch rtorrent 0.16.x (to_kb) applique"
+fi
 
 ###########################################
 # CONFIGURATION NGINX
