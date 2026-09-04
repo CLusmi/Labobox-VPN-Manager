@@ -985,7 +985,7 @@ services:
       - RU_USER=$CLIENT
       - RU_PASSWORD=$PASSWORD
       - TOP_DIR=/data/
-      - RU_DISABLED_PLUGINS=throttle,dump
+      - RU_DISABLED_PLUGINS=throttle,dump,log_history
       - RT_MAX_TORRENT_SIZE=${MAX_TORRENT_SIZE:-0}
     volumes:
       - ${DOCKER_APPS_PATH}/rtorrent:/config/rtorrent

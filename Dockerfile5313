@@ -118,6 +118,8 @@ RUN apk add --no-cache \
     php83-dom \
     php83-simplexml \
     php83-zlib \
+    php83-sqlite3 \
+    php83-zip \
     php83-fileinfo \
     # outils
     mediainfo \
