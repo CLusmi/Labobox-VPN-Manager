@@ -123,6 +123,7 @@ RUN apk add --no-cache \
     zip \
     unzip \
     sox \
+    coreutils \
     procps \
     htop \
     python3 \

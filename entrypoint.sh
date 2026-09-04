@@ -585,10 +585,15 @@ fi
 mkdir -p "\$DEST"
 log "[\$HASH] copie SSD -> NAS (seed en cours): \$SRC -> \$DEST/"
 
-# Copie sans preservation de proprietaire (cp -a echouerait sur NFS en
-# non-root : « Operation not permitted »). Les fichiers appartiennent au
-# client qui ecrit, c'est ce qu'on veut cote NAS.
-if cp -r "\$SRC" "\$DEST/" 2>>"\$LOG"; then
+# Copie en PRESERVANT le mtime (et le mode), mais PAS le proprietaire :
+#  - mtime preserve => rtorrent retrouve son fast-resume (taille + mtime
+#    identiques) et NE re-hash PAS le torrent apres le deplacement. Sans ca,
+#    il relit tout le fichier depuis le NAS pour verifier -> lent + inutile.
+#  - proprietaire non touche => pas d'echec chown sur NFS en non-root
+#    (« Operation not permitted »). Les fichiers appartiennent au client.
+# cp GNU (coreutils) pour --preserve granulaire ; chemin explicite pour ne
+# pas tomber sur le cp busybox.
+if /usr/bin/cp -r --preserve=mode,timestamps "\$SRC" "\$DEST/" 2>>"\$LOG"; then
     # Donnees a plat sur le NAS : bascule breve (torrent seedait -> rien a vider)
     rpc d.stop "\$HASH"
     rpc d.close "\$HASH"
