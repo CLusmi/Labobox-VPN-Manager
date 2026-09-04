@@ -1,0 +1,191 @@
+###############################################
+# VARIANTE DE TEST : ruTorrent 5.3.13          #
+# rtorrent/libtorrent 0.16.5 (INCHANGE)        #
+# LaboBox-VPN - image parallele, ne remplace   #
+# PAS l'image de prod (:latest)                 #
+###############################################
+#
+# But : tester le coeur ruTorrent 5.3.13 (tous les plugins a jour, check_port
+# natif, +mobile/log_history/trackerstatus) SANS toucher a l'image qui tourne.
+#
+#   docker build -f Dockerfile.rutorrent5313 -t laboboxvpn/rtorrent-rutorrent:5313 .
+#
+# Puis, pour un SEUL client, dans son docker-compose.yml, remplacer
+#   image: laboboxvpn/rtorrent-rutorrent:latest
+# par
+#   image: laboboxvpn/rtorrent-rutorrent:5313
+# et  cd /opt/laboboxvpn/clients/<client> && docker compose up -d
+#
+# L'entrypoint est le meme (partage) : le patch to_kb y est un no-op sur
+# 5.3.13 (la ligne corrigee n'existe plus), aucune consequence.
+
+FROM alpine:3.20 AS builder
+
+# Installation des dependances de compilation
+RUN apk add --no-cache \
+    build-base \
+    git \
+    libtool \
+    automake \
+    autoconf \
+    curl-dev \
+    ncurses-dev \
+    openssl-dev \
+    zlib-dev \
+    linux-headers \
+    cppunit-dev \
+    cmake \
+    ninja \
+    udns-dev \
+    wget
+
+# Compilation de xmlrpc-c avec support i8 (64-bit integers)
+WORKDIR /tmp
+RUN wget -q https://sourceforge.net/projects/xmlrpc-c/files/Xmlrpc-c%20Super%20Stable/1.59.03/xmlrpc-c-1.59.03.tgz && \
+    tar xzf xmlrpc-c-1.59.03.tgz && \
+    cd xmlrpc-c-1.59.03 && \
+    ./configure --prefix=/usr/local \
+        --enable-abyss-threads \
+        --enable-long-long \
+        --disable-cgi-server \
+        --disable-libwww-client \
+        --disable-wininet-client && \
+    make -j$(nproc) && \
+    make install
+
+# Compilation de libtorrent v0.16.5 (INCHANGE - la partie stable)
+RUN git clone https://github.com/rakshasa/libtorrent.git && \
+    cd libtorrent && \
+    git checkout v0.16.5 && \
+    autoreconf -fiv && \
+    ./configure --prefix=/usr/local --disable-debug && \
+    make -j$(nproc) && \
+    make install
+
+# Compilation de rtorrent v0.16.5 (INCHANGE)
+RUN git clone https://github.com/rakshasa/rtorrent.git && \
+    cd rtorrent && \
+    git checkout v0.16.5 && \
+    autoreconf -fiv && \
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ./configure --prefix=/usr/local --with-xmlrpc-c=/usr/local/bin/xmlrpc-c-config --disable-debug && \
+    make -j$(nproc) && \
+    make install
+
+###############################################
+# Image finale
+###############################################
+FROM alpine:3.20
+
+LABEL maintainer="laboboxvpn"
+LABEL description="rtorrent 0.16.5 + ruTorrent 5.3.13 (variante de test)"
+LABEL version="3.3.0-rt5313-test"
+
+# Variables d'environnement par defaut
+ENV PUID=1000 \
+    PGID=1000 \
+    TZ=Europe/Paris \
+    RT_PORT=50000 \
+    RT_DHT=off \
+    RT_PEX=no \
+    RT_ENCRYPTION=allow_incoming,try_outgoing,enable_retry \
+    RT_CHECK_HASH=no \
+    RU_USER=admin \
+    RU_PASSWORD=admin \
+    TOP_DIR=/data/ \
+    RU_DISABLED_PLUGINS=""
+
+# Installation des dependances runtime
+RUN apk add --no-cache \
+    bash \
+    curl \
+    shadow \
+    su-exec \
+    tzdata \
+    # rtorrent runtime
+    libcurl \
+    libstdc++ \
+    ncurses \
+    openssl \
+    zlib \
+    cppunit \
+    udns \
+    # nginx + php
+    nginx \
+    php83 \
+    php83-fpm \
+    php83-json \
+    php83-ctype \
+    php83-curl \
+    php83-mbstring \
+    php83-session \
+    php83-sockets \
+    php83-phar \
+    php83-openssl \
+    php83-xml \
+    php83-dom \
+    php83-simplexml \
+    php83-zlib \
+    php83-fileinfo \
+    # outils
+    mediainfo \
+    ffmpeg \
+    p7zip \
+    zip \
+    unzip \
+    sox \
+    procps \
+    htop \
+    python3 \
+    py3-pip
+
+# Installer cloudscraper pour le plugin _cloudflare
+RUN pip3 install --break-system-packages cloudscraper
+
+# Creer un wrapper unrar (utilise 7z)
+RUN echo '#!/bin/sh' > /usr/local/bin/unrar && \
+    echo 'exec 7z x "$@"' >> /usr/local/bin/unrar && \
+    chmod +x /usr/local/bin/unrar
+
+# Copier rtorrent, libtorrent et xmlrpc-c compiles depuis le builder
+COPY --from=builder /usr/local/bin/rtorrent /usr/local/bin/rtorrent
+COPY --from=builder /usr/local/bin/xmlrpc-c-config /usr/local/bin/
+COPY --from=builder /usr/local/lib/libtorrent* /usr/local/lib/
+COPY --from=builder /usr/local/lib/libxmlrpc* /usr/local/lib/
+COPY --from=builder /usr/local/include/xmlrpc* /usr/local/include/
+RUN ldconfig /usr/local/lib || true
+
+# Telecharger ruTorrent v5.3.13 COMPLET (coeur + tous les plugins a jour).
+# check_port y est deja en version recente (ipify) : aucune greffe. Compatible
+# avec la serie rtorrent 0.16.x d'apres le README de ruTorrent 5.3.13.
+WORKDIR /var/www
+RUN apk add --no-cache git && \
+    git clone --depth 1 --branch v5.3.13 https://github.com/Novik/ruTorrent.git rutorrent && \
+    rm -rf rutorrent/.git && \
+    apk del git
+
+# Creer les dossiers necessaires
+RUN mkdir -p \
+    /config/rtorrent/.session \
+    /config/rtorrent/log \
+    /config/rutorrent \
+    /data/torrents \
+    /data/watch \
+    /run/nginx \
+    /run/php \
+    /var/run/rtorrent
+
+# Lien symbolique pour php
+RUN ln -sf /usr/bin/php83 /usr/bin/php
+
+# Copier l'entrypoint (le MEME que l'image de prod)
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Ports
+EXPOSE 8080 50000
+
+# Volumes
+VOLUME ["/config/rtorrent", "/config/rutorrent", "/data"]
+
+# Entrypoint
+ENTRYPOINT ["/entrypoint.sh"]
