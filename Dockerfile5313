@@ -1,9 +1,9 @@
 ###############################################
 # RTORRENT 0.16.5 + RUTORRENT 5.3.13          #
 # Coeur ruTorrent 5.3.13 : tous les plugins a  #
-# jour, check_port natif, +mobile/log_history/ #
-# trackerstatus. rtorrent/libtorrent INCHANGES #
-# (0.16.5). LaboBox-VPN - 2026                 #
+# jour, check_port natif, +mobile +trackerstatus#
+# (log_history retire). rtorrent/libtorrent    #
+# INCHANGES (0.16.5). LaboBox-VPN - 2026        #
 ###############################################
 #
 # Pour l'utiliser : sauvegarder le Dockerfile actuel (ex. le renommer en
