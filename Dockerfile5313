@@ -155,6 +155,7 @@ RUN ldconfig /usr/local/lib || true
 WORKDIR /var/www
 RUN apk add --no-cache git && \
     git clone --depth 1 --branch v5.3.13 https://github.com/Novik/ruTorrent.git rutorrent && \
+    rm -rf rutorrent/plugins/log_history && \
     rm -rf rutorrent/.git && \
     apk del git
 
