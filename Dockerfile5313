@@ -1,23 +1,16 @@
 ###############################################
-# VARIANTE DE TEST : ruTorrent 5.3.13          #
-# rtorrent/libtorrent 0.16.5 (INCHANGE)        #
-# LaboBox-VPN - image parallele, ne remplace   #
-# PAS l'image de prod (:latest)                 #
+# RTORRENT 0.16.5 + RUTORRENT 5.3.13          #
+# Coeur ruTorrent 5.3.13 : tous les plugins a  #
+# jour, check_port natif, +mobile/log_history/ #
+# trackerstatus. rtorrent/libtorrent INCHANGES #
+# (0.16.5). LaboBox-VPN - 2026                 #
 ###############################################
 #
-# But : tester le coeur ruTorrent 5.3.13 (tous les plugins a jour, check_port
-# natif, +mobile/log_history/trackerstatus) SANS toucher a l'image qui tourne.
-#
-#   docker build -f Dockerfile.rutorrent5313 -t laboboxvpn/rtorrent-rutorrent:5313 .
-#
-# Puis, pour un SEUL client, dans son docker-compose.yml, remplacer
-#   image: laboboxvpn/rtorrent-rutorrent:latest
-# par
-#   image: laboboxvpn/rtorrent-rutorrent:5313
-# et  cd /opt/laboboxvpn/clients/<client> && docker compose up -d
-#
-# L'entrypoint est le meme (partage) : le patch to_kb y est un no-op sur
-# 5.3.13 (la ligne corrigee n'existe plus), aucune consequence.
+# Pour l'utiliser : sauvegarder le Dockerfile actuel (ex. le renommer en
+# Dockerfile.5210), puis renommer CE fichier en "Dockerfile", et reconstruire
+# l'image via le menu 3. rtorrent/libtorrent restent en 0.16.5 ; l'entrypoint
+# est identique (le patch to_kb y devient un simple no-op sur 5.3.13, la ligne
+# corrigee n'existant plus). check_port est natif ici : aucune greffe.
 
 FROM alpine:3.20 AS builder
 
