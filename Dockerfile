@@ -142,11 +142,19 @@ COPY --from=builder /usr/local/lib/libxmlrpc* /usr/local/lib/
 COPY --from=builder /usr/local/include/xmlrpc* /usr/local/include/
 RUN ldconfig /usr/local/lib || true
 
-# Telecharger ruTorrent v5.2.10 (version de base eprouvee avec rtorrent 0.16.5)
+# Telecharger ruTorrent v5.2.10 (version de base eprouvee avec rtorrent 0.16.5).
+# On remplace UNIQUEMENT le plugin check_port par sa version recente (tag
+# v5.3.13, pinne) : celui de 5.2.10 detecte l'IP publique en scrapant un site
+# externe dont le format HTML a change -> affichage "?.?.?.?". La version
+# recente utilise l'API ipify (IPv4/IPv6, stable). Ses dependances PHP
+# (rTorrentSettings, rXMLRPCRequest, CachedEcho, Snoopy) existent deja en 5.2.10.
 WORKDIR /var/www
 RUN apk add --no-cache git && \
     git clone --depth 1 --branch v5.2.10 https://github.com/Novik/ruTorrent.git rutorrent && \
-    rm -rf rutorrent/.git && \
+    git clone --depth 1 --branch v5.3.13 https://github.com/Novik/ruTorrent.git /tmp/rt-cp && \
+    rm -rf rutorrent/plugins/check_port && \
+    cp -r /tmp/rt-cp/plugins/check_port rutorrent/plugins/check_port && \
+    rm -rf /tmp/rt-cp rutorrent/.git && \
     apk del git
 
 # Creer les dossiers necessaires
