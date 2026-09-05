@@ -2575,7 +2575,7 @@
                                 {{if .System.NASOnline}}<span class="disk-meter-v {{if gt .System.NASPercent 80.0}}warn{{end}}{{if gt .System.NASPercent 90.0}} danger{{end}}">{{printf "%.0f" .System.NASPercent}}%</span>{{else}}<span class="disk-meter-v off">hors ligne</span>{{end}}
                             </div>
                             <div class="disk-meter-bar"><div class="disk-meter-fill {{if gt .System.NASPercent 80.0}}warning{{end}}{{if gt .System.NASPercent 90.0}} danger{{end}}" style="width: {{if .System.NASOnline}}{{printf "%.0f" .System.NASPercent}}{{else}}0{{end}}%"></div></div>
-                            <div class="disk-meter-note">{{if .System.NASOnline}}{{formatBytes .System.NASUsed}} / {{formatBytes .System.NASTotal}}{{else}}NAS non monté sur /mnt/nas{{end}}</div>
+                            <div class="disk-meter-note">{{if .System.NASOnline}}{{formatBytes .System.NASUsed}} / {{formatBytes .System.NASTotal}} · cumul des partages clients{{else}}NAS non monté sur /mnt/nas{{end}}</div>
                         </div>
                         {{if .System.SSDConfigured}}
                         <div class="disk-meter">
@@ -3245,7 +3245,7 @@
         const list = document.getElementById('cons-list');
         if (!list) return; // pas la vue admin
         try {
-            const response = await fetch('/api/bandwidth'); // admin sans client = agrégat
+            const response = await fetch('/api/bandwidth?scope=all'); // agrégat colocation (admin)
             if (!response.ok) return;
             const data = await response.json();
 

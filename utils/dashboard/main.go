@@ -952,13 +952,12 @@ func collectSystem() SystemStats {
 	if used, total, pct, ok := dfStats("/"); ok {
 		stats.DiskUsed, stats.DiskTotal, stats.DiskPercent = used, total, pct
 	}
-	// Espace HDD : NAS Synology monté sur /mnt/nas (peut être hors ligne). On
-	// vérifie d'abord que c'est bien un point de montage : sinon `df /mnt/nas`
-	// renverrait par erreur les stats du disque racine (dossier vide sur /).
-	if isMounted(NAS_MOUNT) {
-		if used, total, pct, ok := dfStats(NAS_MOUNT); ok && total > 0 {
-			stats.NASUsed, stats.NASTotal, stats.NASPercent = used, total, pct
-			stats.NASOnline = true
+	// Espace HDD : le NAS est monté par client sous /mnt/nas/<X> (il n'y a pas de
+	// point de montage unique sur /mnt/nas). On agrège les partages clients.
+	if used, total, online := collectNAS(); online {
+		stats.NASUsed, stats.NASTotal, stats.NASOnline = used, total, true
+		if total > 0 {
+			stats.NASPercent = float64(used) / float64(total) * 100
 		}
 	}
 	// Espace SSD : disque temporaire TEMP_DIR (laboboxvpn.conf) s'il est configuré.
@@ -1020,20 +1019,61 @@ func dfStats(path string) (used, total int64, pct float64, ok bool) {
 	return
 }
 
-// isMounted indique si `path` est un véritable point de montage (présent dans
-// /proc/mounts). Sert à distinguer un NAS réellement monté d'un dossier vide.
-func isMounted(path string) bool {
+// collectNAS agrège l'espace des partages NAS montés par client sous
+// /mnt/nas/<X> (il n'y a pas de point de montage unique sur /mnt/nas). On ne
+// retient que les montages de premier niveau — les sous-montages /mnt/nas/<X>/data
+// pointent sur les mêmes données et seraient comptés deux fois. Un seul `df`
+// couvre tous les points, avec timeout, pour ne pas bloquer si un export gèle.
+func collectNAS() (used, total int64, online bool) {
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
-		return false
+		return
 	}
+	prefix := NAS_MOUNT + "/"
+	var mounts []string
+	seen := map[string]bool{}
 	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == path {
-			return true
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		mp := f[1]
+		if !strings.HasPrefix(mp, prefix) {
+			continue
+		}
+		if rest := strings.TrimPrefix(mp, prefix); rest == "" || strings.Contains(rest, "/") {
+			continue // sous-montage (ex. .../data) : ignoré
+		}
+		if !seen[mp] {
+			seen[mp] = true
+			mounts = append(mounts, mp)
 		}
 	}
-	return false
+	if len(mounts) == 0 {
+		return
+	}
+	online = true // des partages sont montés (même si le df échoue ensuite)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	args := append([]string{"-B1", "--output=used,size"}, mounts...)
+	out, err := exec.CommandContext(ctx, "df", args...).Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue // en-tête « Used Size » et lignes vides
+		}
+		u, e1 := strconv.ParseInt(f[0], 10, 64)
+		t, e2 := strconv.ParseInt(f[1], 10, 64)
+		if e1 != nil || e2 != nil {
+			continue
+		}
+		used += u
+		total += t
+	}
+	return
 }
 
 // readTempDir extrait la valeur de TEMP_DIR (chemin du SSD temporaire) depuis la
@@ -1560,6 +1600,24 @@ func handleAPIBandwidth(w http.ResponseWriter, r *http.Request) {
 	session := getSession(r)
 	if session == nil {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Agrégat colocation (admin) demandé explicitement via ?scope=all. Nécessaire
+	// car l'admin est aussi un client : sinon clientName prendrait son propre nom
+	// et l'agrégat ne serait jamais renvoyé (le widget « Top consommateurs »
+	// n'aurait alors que les stats de l'admin, sans la liste des clients).
+	if r.URL.Query().Get("scope") == "all" {
+		if session.User.Role != "admin" {
+			http.Error(w, "Non autorisé", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		var allStats map[string]BandwidthClientStats
+		if data, err := os.ReadFile(BANDWIDTH_STATS_FILE); err == nil {
+			json.Unmarshal(data, &allStats)
+		}
+		json.NewEncoder(w).Encode(aggregateBandwidth(allStats))
 		return
 	}
 
