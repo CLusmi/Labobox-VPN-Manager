@@ -582,24 +582,22 @@ if [ ! -e "\$SRC" ]; then
     exit 1
 fi
 
-# Emplacement final. Un torrent MULTI-FICHIERS possede un dossier racine (son
-# nom) ; rtorrent avait deja ajoute ce nom a d.directory a l'ajout, donc
-# labobox_dest vaut categorie/Nom. Copier la source DANS labobox_dest donnerait
-# categorie/Nom/Nom/... (dossier en double). On retire donc le nom quand il est
-# deja present : on copie au niveau de la CATEGORIE, comme un torrent normal
-# (categorie/Nom/fichiers), a l'identique d'un download direct sur le NAS.
-#  - CAT       : dossier categorie qui doit CONTENIR l'entree du torrent.
-#  - FINAL_DIR : dossier que rtorrent doit pointer (d.directory).
-if [ -d "\$SRC" ]; then
-    if [ "\$(basename "\$DEST")" = "\$BASE" ]; then
-        CAT="\$(dirname "\$DEST")"
-    else
-        CAT="\$DEST"
-    fi
-    FINAL_DIR="\$CAT/\$BASE"
+# CATEGORIE de destination = le dossier qui doit CONTENIR l'entree du torrent.
+# POINT CLE : pour un torrent MULTI-FICHIERS, rtorrent ajoute LUI-MEME le nom du
+# torrent a d.directory (a l'ajout ET quand on repointe le torrent via
+# d.directory.set). labobox_dest vaut donc categorie/Nom pour un multi, et
+# categorie tout court pour un mono. On calcule la categorie en retirant le nom
+# du torrent quand il est deja present :
+#  - on copie la source AU NIVEAU DE LA CATEGORIE (=> categorie/Nom/fichiers pour
+#    un multi, categorie/fichier pour un mono), comme un download direct ;
+#  - on pointe ensuite d.directory sur la CATEGORIE (voir bascule plus bas) :
+#    rtorrent y re-ajoute le nom pour un multi (categorie -> categorie/Nom), la
+#    ou sont justement les donnees. Pointer categorie/Nom donnerait
+#    categorie/Nom/Nom (introuvable) => torrent a 0% en pause.
+if [ -d "\$SRC" ] && [ "\$(basename "\$DEST")" = "\$BASE" ]; then
+    CAT="\$(dirname "\$DEST")"
 else
     CAT="\$DEST"
-    FINAL_DIR="\$CAT"
 fi
 
 mkdir -p "\$CAT"
@@ -639,13 +637,17 @@ if [ "\$copy_ok" = 0 ]; then
     # brut SSD vs NAS separement, voir le menu Benchmarks.
     ELAPSED=\$((T1 - T0)); [ "\$ELAPSED" -lt 1 ] && ELAPSED=1
     log "[\$HASH] copie SSD->NAS: \$(awk -v k="\$SIZE_KB" -v t="\$ELAPSED" 'BEGIN{gb=k/1048576;mb=k/1024;printf "%.2f Go en %ds (%.0f Mo/s ecriture NAS)", gb, t, mb/t}')"
-    # Donnees a plat sur le NAS : bascule breve (torrent seedait -> rien a vider)
+    # Donnees a plat sur le NAS : bascule breve (torrent seedait -> rien a vider).
+    # d.directory sur la CATEGORIE (rtorrent y re-ajoute le nom du torrent pour un
+    # multi, pointe directement la categorie pour un mono). On SUPPRIME le SSD
+    # AVANT de relancer, pour que rtorrent rouvre le torrent uniquement depuis le
+    # NAS et ne recree aucun dossier residuel sur le SSD.
     rpc d.stop "\$HASH"
     rpc d.close "\$HASH"
-    rpc d.directory.set "\$HASH" "\$FINAL_DIR"
+    rpc d.directory.set "\$HASH" "\$CAT"
+    rm -rf "\$SRC"
     rpc d.start "\$HASH"
     rpc d.save_full_session "\$HASH"
-    rm -rf "\$SRC"
     log "[\$HASH] OK: seed depuis \$CAT/\$BASE"
 else
     # Copie partielle nettoyee ; le torrent continue de seeder depuis le SSD
