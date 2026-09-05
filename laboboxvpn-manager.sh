@@ -3274,10 +3274,14 @@ cmd_sequential_start() {
     # Compter les apps installées
     local apps_count=0
     local apps_list=""
-    is_plex_installed && ((apps_count++)) && apps_list="${apps_list}Plex "
-    is_jellyfin_installed && ((apps_count++)) && apps_list="${apps_list}Jellyfin "
-    is_resilio_installed && ((apps_count++)) && apps_list="${apps_list}Resilio "
-    is_watchtower_installed && ((apps_count++)) && apps_list="${apps_list}Watchtower "
+    # NB : ne PAS écrire « is_x && ((apps_count++)) && apps_list=... » : le
+    # post-incrément ((n++)) renvoie l'ANCIENNE valeur comme code retour, donc
+    # quand apps_count vaut 0 (1re app testée = Plex) il retourne 1 (échec) et
+    # coupe le « && apps_list=... » -> l'app est comptée mais absente de la liste.
+    if is_plex_installed;       then apps_count=$((apps_count + 1)); apps_list="${apps_list}Plex "; fi
+    if is_jellyfin_installed;   then apps_count=$((apps_count + 1)); apps_list="${apps_list}Jellyfin "; fi
+    if is_resilio_installed;    then apps_count=$((apps_count + 1)); apps_list="${apps_list}Resilio "; fi
+    if is_watchtower_installed; then apps_count=$((apps_count + 1)); apps_list="${apps_list}Watchtower "; fi
     
     echo -e "  ${WHITE}Configuration :${NC}"
     print_item "Clients" "$client_count"
