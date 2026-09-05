@@ -46,6 +46,21 @@ TEMP_DIR=""
 # Défaut : 6 To (6 * 1024^4). Modifiable via le menu Monitoring.
 MAX_TORRENT_SIZE="6597069766656"
 
+# --- Profil de performance rtorrent (peers + slots d'upload/download) ---
+# Propagé au docker-compose de chaque client (pas de rebuild : recréer le
+# conteneur suffit). 3 presets (leger/moyen/large) ou "perso" (valeurs à la
+# main). Ces réglages ne touchent PAS DHT/PEX (désactivés à part, pour les
+# trackers privés). Défaut = large (mêmes valeurs que l'image).
+PERF_PROFILE="large"
+RT_MIN_PEERS="40"
+RT_MAX_PEERS="200"
+RT_MIN_PEERS_SEED="30"
+RT_MAX_PEERS_SEED="200"
+RT_MAX_UPLOADS="20"
+RT_MAX_UPLOADS_GLOBAL="400"
+RT_MAX_DOWNLOADS="16"
+RT_MAX_DOWNLOADS_GLOBAL="250"
+
 # Charger la configuration si elle existe
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
@@ -70,6 +85,15 @@ SSH_PORT="${SSH_PORT}"
 NAS_IP="${NAS_IP}"
 TEMP_DIR="${TEMP_DIR}"
 MAX_TORRENT_SIZE="${MAX_TORRENT_SIZE}"
+PERF_PROFILE="${PERF_PROFILE}"
+RT_MIN_PEERS="${RT_MIN_PEERS}"
+RT_MAX_PEERS="${RT_MAX_PEERS}"
+RT_MIN_PEERS_SEED="${RT_MIN_PEERS_SEED}"
+RT_MAX_PEERS_SEED="${RT_MAX_PEERS_SEED}"
+RT_MAX_UPLOADS="${RT_MAX_UPLOADS}"
+RT_MAX_UPLOADS_GLOBAL="${RT_MAX_UPLOADS_GLOBAL}"
+RT_MAX_DOWNLOADS="${RT_MAX_DOWNLOADS}"
+RT_MAX_DOWNLOADS_GLOBAL="${RT_MAX_DOWNLOADS_GLOBAL}"
 EOF
     chmod 600 "$CONFIG_FILE"
 }
@@ -989,6 +1013,14 @@ services:
       - TOP_DIR=/data/
       - RU_DISABLED_PLUGINS=throttle,dump,log_history
       - RT_MAX_TORRENT_SIZE=${MAX_TORRENT_SIZE:-0}
+      - RT_MIN_PEERS=${RT_MIN_PEERS}
+      - RT_MAX_PEERS=${RT_MAX_PEERS}
+      - RT_MIN_PEERS_SEED=${RT_MIN_PEERS_SEED}
+      - RT_MAX_PEERS_SEED=${RT_MAX_PEERS_SEED}
+      - RT_MAX_UPLOADS=${RT_MAX_UPLOADS}
+      - RT_MAX_UPLOADS_GLOBAL=${RT_MAX_UPLOADS_GLOBAL}
+      - RT_MAX_DOWNLOADS=${RT_MAX_DOWNLOADS}
+      - RT_MAX_DOWNLOADS_GLOBAL=${RT_MAX_DOWNLOADS_GLOBAL}
     volumes:
       - ${DOCKER_APPS_PATH}/rtorrent:/config/rtorrent
       - ${DOCKER_APPS_PATH}/rutorrent:/config/rutorrent
@@ -2877,6 +2909,176 @@ cmd_migrate_sessions() {
 # La session rtorrent vit TOUJOURS sur le NAS (voir entrypoint) : plus de
 # choix d'emplacement. Ce petit menu active ou desactive le disque SSD
 # temporaire pour les clients.
+###########################################
+# PERFORMANCE RTORRENT (peers / upload)
+###########################################
+# Presets + valeurs à la main, propagés au docker-compose de chaque client
+# (env RT_*), relus par l'entrypoint à la (re)création du conteneur -> pas de
+# rebuild d'image. Ne touche PAS DHT/PEX (gérés à part, off pour le privé).
+
+# Applique un preset dans les variables globales.
+perf_set_preset() {
+    case "$1" in
+        leger)
+            RT_MIN_PEERS=10;  RT_MAX_PEERS=60
+            RT_MIN_PEERS_SEED=4;  RT_MAX_PEERS_SEED=30
+            RT_MAX_UPLOADS=4;  RT_MAX_UPLOADS_GLOBAL=100
+            RT_MAX_DOWNLOADS=8;  RT_MAX_DOWNLOADS_GLOBAL=100
+            PERF_PROFILE=leger ;;
+        moyen)
+            RT_MIN_PEERS=25;  RT_MAX_PEERS=120
+            RT_MIN_PEERS_SEED=15;  RT_MAX_PEERS_SEED=80
+            RT_MAX_UPLOADS=10;  RT_MAX_UPLOADS_GLOBAL=250
+            RT_MAX_DOWNLOADS=16;  RT_MAX_DOWNLOADS_GLOBAL=250
+            PERF_PROFILE=moyen ;;
+        large)
+            RT_MIN_PEERS=40;  RT_MAX_PEERS=200
+            RT_MIN_PEERS_SEED=30;  RT_MAX_PEERS_SEED=200
+            RT_MAX_UPLOADS=20;  RT_MAX_UPLOADS_GLOBAL=400
+            RT_MAX_DOWNLOADS=16;  RT_MAX_DOWNLOADS_GLOBAL=250
+            PERF_PROFILE=large ;;
+    esac
+}
+
+# Met à jour (ou insère) une ligne d'env RT_* dans un docker-compose.
+_perf_set_env() {
+    local f="$1" k="$2" v="$3"
+    if grep -q "      - ${k}=" "$f"; then
+        sed -i "s|      - ${k}=.*|      - ${k}=${v}|" "$f"
+    else
+        sed -i "\|- RU_DISABLED_PLUGINS=|a\\      - ${k}=${v}" "$f"
+    fi
+}
+
+# Propage les 8 valeurs à tous les clients. Renvoie (echo) le nombre de clients.
+perf_apply_to_composes() {
+    local _c _cf _n=0
+    for _c in $(get_clients); do
+        _cf="$CLIENTS_DIR/$_c/docker-compose.yml"
+        [ -f "$_cf" ] || continue
+        _perf_set_env "$_cf" RT_MIN_PEERS "$RT_MIN_PEERS"
+        _perf_set_env "$_cf" RT_MAX_PEERS "$RT_MAX_PEERS"
+        _perf_set_env "$_cf" RT_MIN_PEERS_SEED "$RT_MIN_PEERS_SEED"
+        _perf_set_env "$_cf" RT_MAX_PEERS_SEED "$RT_MAX_PEERS_SEED"
+        _perf_set_env "$_cf" RT_MAX_UPLOADS "$RT_MAX_UPLOADS"
+        _perf_set_env "$_cf" RT_MAX_UPLOADS_GLOBAL "$RT_MAX_UPLOADS_GLOBAL"
+        _perf_set_env "$_cf" RT_MAX_DOWNLOADS "$RT_MAX_DOWNLOADS"
+        _perf_set_env "$_cf" RT_MAX_DOWNLOADS_GLOBAL "$RT_MAX_DOWNLOADS_GLOBAL"
+        _n=$((_n + 1))
+    done
+    echo "$_n"
+}
+
+# Saisie d'une valeur numérique ; garde l'actuelle si vide ou non numérique.
+_perf_ask() {
+    local p="$1" cur="$2" v
+    read -rp "  ${p} [${cur}] : " v
+    case "$v" in ''|*[!0-9]*) echo "$cur" ;; *) echo "$v" ;; esac
+}
+
+perf_custom_input() {
+    echo ""
+    echo -e "  ${DIM}Entrée vide (ou non numérique) = garder la valeur actuelle.${NC}"
+    echo ""
+    RT_MIN_PEERS=$(_perf_ask "Peers download  min" "$RT_MIN_PEERS")
+    RT_MAX_PEERS=$(_perf_ask "Peers download  max" "$RT_MAX_PEERS")
+    RT_MIN_PEERS_SEED=$(_perf_ask "Peers seed      min" "$RT_MIN_PEERS_SEED")
+    RT_MAX_PEERS_SEED=$(_perf_ask "Peers seed      max" "$RT_MAX_PEERS_SEED")
+    RT_MAX_UPLOADS=$(_perf_ask "Upload   slots /torrent" "$RT_MAX_UPLOADS")
+    RT_MAX_UPLOADS_GLOBAL=$(_perf_ask "Upload   slots global  " "$RT_MAX_UPLOADS_GLOBAL")
+    RT_MAX_DOWNLOADS=$(_perf_ask "Download slots /torrent" "$RT_MAX_DOWNLOADS")
+    RT_MAX_DOWNLOADS_GLOBAL=$(_perf_ask "Download slots global  " "$RT_MAX_DOWNLOADS_GLOBAL")
+    PERF_PROFILE=perso
+}
+
+perf_show_table() {
+    echo ""
+    echo -e "  ${WHITE}Comparaison des profils${NC}"
+    echo ""
+    printf "  %-26s %9s %9s %9s\n" "" "Leger" "Moyen" "Large"
+    printf "  %-26s %9s %9s %9s\n" "Peers download (min/max)" "10/60" "25/120" "40/200"
+    printf "  %-26s %9s %9s %9s\n" "Peers seed (min/max)" "4/30" "15/80" "30/200"
+    printf "  %-26s %9s %9s %9s\n" "Upload /torrent" "4" "10" "20"
+    printf "  %-26s %9s %9s %9s\n" "Upload global" "100" "250" "400"
+    printf "  %-26s %9s %9s %9s\n" "Download /torrent" "8" "16" "16"
+    printf "  %-26s %9s %9s %9s\n" "Download global" "100" "250" "250"
+    echo ""
+    echo -e "  ${DIM}Leger : menage les HDD du NAS (peu de flux). Large : upload max sur${NC}"
+    echo -e "  ${DIM}les releases populaires. L'upload depend surtout de la DEMANDE${NC}"
+    echo -e "  ${DIM}(leechers) et d'un port ouvert. DHT/PEX restent off (trackers prives).${NC}"
+}
+
+# Enregistre + propage + propose la recréation des conteneurs.
+perf_commit() {
+    echo ""
+    if save_config; then
+        echo -e "  ${GREEN}✔ Profil « ${PERF_PROFILE} » enregistré${NC}"
+    else
+        echo -e "  ${RED}✗ Impossible d'écrire ${CONFIG_FILE}${NC}"
+    fi
+    local n; n=$(perf_apply_to_composes)
+    if [ "${n:-0}" -gt 0 ]; then
+        echo -e "  ${GREEN}✔ Propagé au docker-compose de ${n} client(s)${NC}"
+        echo ""
+        read_choice "Recréer les conteneurs maintenant pour appliquer ? (o/N)" "N"
+        case "$MENU_CHOICE" in
+            o|O|y|Y)
+                local _c
+                for _c in $(get_clients); do
+                    [ -f "$CLIENTS_DIR/$_c/docker-compose.yml" ] || continue
+                    echo -e "  ${DIM}  → ${_c}${NC}"
+                    ( cd "$CLIENTS_DIR/$_c" && docker compose up -d >/dev/null 2>&1 )
+                done
+                echo -e "  ${GREEN}✔ Conteneurs recréés — nouveau profil actif${NC}"
+                ;;
+            *)
+                echo -e "  ${DIM}  À appliquer plus tard : cd ${CLIENTS_DIR}/<client> && docker compose up -d${NC}"
+                ;;
+        esac
+    else
+        echo -e "  ${DIM}  Aucun client existant — le profil s'appliquera aux prochains ajouts.${NC}"
+    fi
+    press_enter
+}
+
+interactive_perf_menu() {
+    while true; do
+        print_menu_header
+        echo -e "  ${WHITE}PERFORMANCE RTORRENT (PEERS / UPLOAD)${NC}"
+        line
+        echo ""
+        echo -e "  Profil actuel : ${CYAN}${PERF_PROFILE}${NC}"
+        echo ""
+        echo -e "  ${DIM}Réglages appliqués :${NC}"
+        printf "    %-22s min %s / max %s\n" "Peers download" "$RT_MIN_PEERS" "$RT_MAX_PEERS"
+        printf "    %-22s min %s / max %s\n" "Peers seed" "$RT_MIN_PEERS_SEED" "$RT_MAX_PEERS_SEED"
+        printf "    %-22s %s /torrent, %s global\n" "Slots upload" "$RT_MAX_UPLOADS" "$RT_MAX_UPLOADS_GLOBAL"
+        printf "    %-22s %s /torrent, %s global\n" "Slots download" "$RT_MAX_DOWNLOADS" "$RT_MAX_DOWNLOADS_GLOBAL"
+        echo ""
+        echo -e "  ${DIM}Trackers privés : DHT/PEX restent désactivés (anti-ban).${NC}"
+        echo ""
+        print_menu_option "1" "-" "Profil Léger   ${DIM}(ménage le NAS, peu de peers)${NC}"
+        print_menu_option "2" "-" "Profil Moyen   ${DIM}(équilibré)${NC}"
+        print_menu_option "3" "-" "Profil Large   ${DIM}(upload max, releases populaires)${NC}"
+        print_menu_option "4" "-" "Personnalisé   ${DIM}(saisir chaque valeur)${NC}"
+        print_menu_option "5" "-" "Comparer les 3 profils"
+        print_menu_separator
+        print_menu_option "0" "-" "Retour"
+
+        read_choice "Votre choix" ""
+
+        case $MENU_CHOICE in
+            1) perf_set_preset leger; perf_commit ;;
+            2) perf_set_preset moyen; perf_commit ;;
+            3) perf_set_preset large; perf_commit ;;
+            4) perf_custom_input; perf_commit ;;
+            5) perf_show_table; press_enter ;;
+            0|q|Q) return ;;
+            *) ;;
+        esac
+    done
+}
+
 interactive_temp_toggle() {
     print_menu_header
 
@@ -6267,10 +6469,11 @@ interactive_maintenance_menu() {
 
         print_menu_option "9" "-" "Monter tous les partages NAS"
         print_menu_option "10" "-" "Optimisation réseau & stockage NFS"
-        print_menu_option "11" "-" "Activer / Désactiver le disque SSD temporaire"
-        print_menu_option "12" "-" "$(echo -e "$autostart_label")"
+        print_menu_option "11" "-" "Performance rtorrent (peers / upload)"
+        print_menu_option "12" "-" "Activer / Désactiver le disque SSD temporaire"
+        print_menu_option "13" "-" "$(echo -e "$autostart_label")"
         print_menu_separator
-        print_menu_option "13" "-" "Désinstaller tout"
+        print_menu_option "14" "-" "Désinstaller tout"
         print_menu_separator
         print_menu_option "0" "-" "Retour"
 
@@ -6305,8 +6508,9 @@ interactive_maintenance_menu() {
             8) cmd_sequential_stop; press_enter ;;
             9) cmd_mount; press_enter ;;
             10) interactive_network_optimize_menu ;;
-            11) interactive_temp_toggle ;;
-            12)
+            11) interactive_perf_menu ;;
+            12) interactive_temp_toggle ;;
+            13)
                 if is_autostart_enabled; then
                     cmd_autostart_disable
                 else
@@ -6314,7 +6518,7 @@ interactive_maintenance_menu() {
                 fi
                 press_enter
                 ;;
-            13) cmd_uninstall; press_enter ;;
+            14) cmd_uninstall; press_enter ;;
             0|q|Q) return ;;
             *) ;;
         esac
