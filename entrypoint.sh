@@ -48,27 +48,32 @@ RT_MEMORY_MAX="${RT_MEMORY_MAX:-4096M}"
 # RT_MAX_OPEN_FILES : ces fd ne passent pas par le select(), on peut monter haut.
 #   Evite de refermer/rouvrir les fichiers en permanence (couteux sur NFS).
 RT_MAX_OPEN_FILES="${RT_MAX_OPEN_FILES:-3072}"
-# RT_MAX_OPEN_SOCKETS : celles-ci SONT dans le select(), rester serre.
-RT_MAX_OPEN_SOCKETS="${RT_MAX_OPEN_SOCKETS:-900}"
+# RT_MAX_OPEN_SOCKETS : celles-ci SONT dans le select(). Releve pour tenir le
+# profil seed agressif (plus de peers simultanes) ; reste sous l'ulimit vise.
+RT_MAX_OPEN_SOCKETS="${RT_MAX_OPEN_SOCKETS:-1500}"
 
 # --- Peers (par torrent) ---
-# Deux profils distincts :
-#  * NORMAL (torrent EN TELECHARGEMENT) : les ecritures vont sur le SSD, on
-#    peut donc lacher les chevaux pour saturer la connexion (beaucoup de peers).
-#  * SEED (torrent TERMINE) : les lectures se font sur le NAS (disques
-#    mecaniques). Genereux mais borne, pour ne pas noyer l'array en lectures
-#    aleatoires. C'etait tout l'interet du disque temporaire.
-RT_MIN_PEERS="${RT_MIN_PEERS:-20}"
-RT_MAX_PEERS="${RT_MAX_PEERS:-100}"
-RT_MIN_PEERS_SEED="${RT_MIN_PEERS_SEED:-5}"
-RT_MAX_PEERS_SEED="${RT_MAX_PEERS_SEED:-50}"
+# Profil SEED AGRESSIF (trackers prives, port ouvert) : on maximise le nombre de
+# leechers servis simultanement. Utile SURTOUT sur les torrents populaires (une
+# release fraiche avec beaucoup de leechers) ; sur un torrent a 3 leechers, plus
+# de slots ne change rien (l'upload depend de la DEMANDE, pas de la config).
+#  * NORMAL (EN TELECHARGEMENT) : ecritures sur le SSD -> on ouvre grand.
+#  * SEED (TERMINE) : lectures sur le NAS (disques mecaniques). On monte haut
+#    pour l'upload ; contrepartie = plus de lectures aleatoires sur l'array (si
+#    le NAS peine, redescendre RT_MAX_PEERS_SEED / RT_MAX_UPLOADS).
+# NB trackers prives : DHT/PEX/LSD restent DESACTIVES (sinon risque de ban).
+RT_MIN_PEERS="${RT_MIN_PEERS:-40}"
+RT_MAX_PEERS="${RT_MAX_PEERS:-200}"
+RT_MIN_PEERS_SEED="${RT_MIN_PEERS_SEED:-30}"
+RT_MAX_PEERS_SEED="${RT_MAX_PEERS_SEED:-200}"
 
 # --- Slots (= flux d'IO simultanes) ---
-# En download c'est du SSD (rapide) : on ouvre grand. Les uploads restent
-# raisonnables par torrent (le seed lit sur le NAS).
-RT_MAX_UPLOADS_GLOBAL="${RT_MAX_UPLOADS_GLOBAL:-250}"
+# max_uploads par torrent = nombre de leechers servis EN MEME TEMPS sur un meme
+# torrent : c'est le levier le plus direct sur l'upload d'une release populaire.
+# Contrepartie : autant de lectures aleatoires simultanees sur le NAS.
+RT_MAX_UPLOADS_GLOBAL="${RT_MAX_UPLOADS_GLOBAL:-400}"
 RT_MAX_DOWNLOADS_GLOBAL="${RT_MAX_DOWNLOADS_GLOBAL:-250}"
-RT_MAX_UPLOADS="${RT_MAX_UPLOADS:-8}"
+RT_MAX_UPLOADS="${RT_MAX_UPLOADS:-20}"
 RT_MAX_DOWNLOADS="${RT_MAX_DOWNLOADS:-16}"
 
 # --- Taille max d'un torrent accepte (garde-fou) ---
@@ -305,8 +310,9 @@ network.http.max_open.set = 32
 ##############################################
 # PEERS (par torrent)
 ##############################################
-# En seed, une poignee de peers suffit a trouver des leechers. Multiplier
-# les peers multiplie surtout les lectures aleatoires sur l'array.
+# Profil seed agressif : on garde beaucoup de peers pour servir un max de
+# leechers a la fois. Utile sur les torrents populaires ; sans effet quand il
+# n'y a pas de demande. Contrepartie : plus de lectures aleatoires sur l'array.
 throttle.min_peers.normal.set = ${RT_MIN_PEERS}
 throttle.max_peers.normal.set = ${RT_MAX_PEERS}
 throttle.min_peers.seed.set = ${RT_MIN_PEERS_SEED}
