@@ -267,8 +267,10 @@ print_menu_option() {
     local num=$1
     local icon=$2
     local label=$3
-    # Format: marge de 2 espaces, numéro aligné à droite sur 2 chars, tiret, label
-    printf "  %2s  %s  %s\n" "$num" "$icon" "$label"
+    # Format: marge de 2 espaces, numéro aligné à droite sur 2 chars, tiret, label.
+    # Le label est imprime avec %b pour interpreter d'eventuels codes couleur
+    # (ex. ${DIM}...${NC}), comme le fait « echo -e » ailleurs dans le script.
+    printf "  %2s  %s  %b\n" "$num" "$icon" "$label"
 }
 
 print_menu_separator() {
