@@ -426,7 +426,7 @@ cat >> /tmp/rtorrent.rc << 'TEMPEOF'
 # Garde-fou taille (refuse a l'ajout un torrent trop gros).
 method.set_key = event.download.inserted_new, labobox_guard, "execute.throw.bg=/usr/local/bin/labobox-guard,$d.hash=,$d.size_bytes="
 # Memorise la destination finale, redirige le download vers le SSD (miroir categorie).
-method.set_key = event.download.inserted_new, labobox_grab, "d.custom.set=labobox_dest,(d.directory) ; d.directory.set=(execute.capture,/usr/local/bin/labobox-ssdpath,(d.directory))"
+method.set_key = event.download.inserted_new, labobox_grab, "d.custom.set=labobox_dest,(d.directory) ; d.directory.set=(execute.capture,/usr/local/bin/labobox-ssdpath,(d.directory),(d.is_multi_file))"
 # d.data_path : dossier du torrent (multi-fichiers) ou fichier (mono).
 method.insert = d.data_path, simple, "if=(d.is_multi_file), (cat,(d.directory)), (cat,(d.directory),/,(d.name))"
 # A la completion : on lance UNIQUEMENT le deplaceur en arriere-plan. On NE
@@ -506,8 +506,16 @@ XMLRPCEOF
     # chemin et cree le dossier a la volee. Toujours un chemin valide en sortie.
     cat > /usr/local/bin/labobox-ssdpath << 'SSDPATHEOF'
 #!/bin/bash
-# labobox-ssdpath <destination_finale>  ->  imprime le chemin SSD miroir
+# labobox-ssdpath <destination> [is_multi_file]  ->  imprime le chemin SSD miroir
+# Pour un torrent MULTI-FICHIERS, d.directory contient DEJA le nom du torrent
+# (categorie/Nom). On ne mappe donc QUE la categorie : rtorrent re-ajoute le nom
+# du torrent tout seul en pointant le SSD, ce qui donne /temp/categorie/Nom (un
+# seul niveau). Sinon on obtiendrait /temp/categorie/Nom/Nom, et le deplaceur
+# laisserait le niveau en trop (dossier vide) sur le SSD apres la copie.
 DEST="${1%/}"
+if [ "${2:-0}" = "1" ]; then
+    DEST="${DEST%/*}"
+fi
 case "$DEST" in
     /data/torrents/*) SSD="/temp/${DEST#/data/torrents/}" ;;
     /data/torrents)   SSD="/temp" ;;
