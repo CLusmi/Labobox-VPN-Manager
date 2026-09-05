@@ -6270,16 +6270,142 @@ interactive_start_client() {
     press_enter
 }
 
-interactive_stop_client() {
+###########################################
+# RÉPARATION D'UN CLIENT QUI NE DÉMARRE PAS
+###########################################
+# Cause fréquente (restart: no + sortie sale d'un conteneur, ou changement d'IP
+# hôte) : un docker-proxy ORPHELIN garde le port du client -> au prochain
+# « up », « address already in use ». On nettoie (down), on libère les ports
+# tenus par un docker-proxy sans conteneur, on remonte le NAS, on relance, puis
+# on attend que gluetun soit healthy.
+
+# Tue les docker-proxy orphelins qui tiennent encore un des ports donnés.
+# Sûr : ne tue QUE des processus nommés « docker-proxy » (jamais un service tiers).
+_free_orphan_proxy() {
+    local p pid freed=0
+    command -v ss >/dev/null 2>&1 || return 0
+    for p in "$@"; do
+        [ -n "$p" ] || continue
+        for pid in $(ss -tulpn 2>/dev/null | grep -E ":${p} " | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+            if [ "$(cat /proc/$pid/comm 2>/dev/null)" = "docker-proxy" ]; then
+                kill "$pid" 2>/dev/null && { freed=1; echo -e "  ${DIM}  port ${p} : docker-proxy orphelin (pid ${pid}) libéré${NC}"; }
+            fi
+        done
+    done
+    [ "$freed" = 1 ] && sleep 1
+    return 0
+}
+
+# Répare UN client. Renvoie 0 si gluetun devient healthy, 1 sinon.
+_repair_one() {
+    local client=$1
+    local dir="$CLIENTS_DIR/$client"
+    if [ ! -f "$dir/docker-compose.yml" ]; then
+        echo -e "  ${RED}✗${NC} ${client} ${DIM}(docker-compose.yml introuvable)${NC}"
+        return 1
+    fi
+    local pw pr
+    pw=$(grep "PORT_RUTORRENT_WEBUI" "$dir/info.txt" 2>/dev/null | cut -d: -f2 | tr -d ' ')
+    pr=$(grep "PORT_RTORRENT_VPN"   "$dir/info.txt" 2>/dev/null | cut -d: -f2 | tr -d ' ')
+    echo -e "  ${WHITE}${client}${NC} ${DIM}(WebUI ${pw:-?}, RT ${pr:-?})${NC}"
+
+    # 1. Nettoyage : supprime conteneurs + réseau du projet (et normalement le proxy)
+    ( cd "$dir" && docker compose down >/dev/null 2>&1 )
+    # 2. Libère un éventuel docker-proxy orphelin resté collé au port
+    _free_orphan_proxy "$pw" "$pr"
+    # 3. NAS monté (rtorrent doit pouvoir écrire)
+    mount_nas_for_client "$client" 2>/dev/null || true
+    # 4. Relance, en capturant l'erreur éventuelle de bind de port
+    local out
+    out=$( cd "$dir" && docker compose up -d 2>&1 )
+    if echo "$out" | grep -qi 'address already in use'; then
+        echo -e "  ${RED}✗${NC} port encore occupé après nettoyage."
+        echo -e "  ${DIM}     Réseau Docker en vrac -> ${YELLOW}systemctl restart docker${NC}${DIM} puis Démarrage séquentiel.${NC}"
+        return 1
+    fi
+    # 5. Attente du healthcheck gluetun
+    local elapsed=0 health=""
+    echo -ne "  gluetun: ${DIM}attente healthcheck...${NC}"
+    while [ $elapsed -lt $STARTUP_HEALTHCHECK_TIMEOUT ]; do
+        health=$(docker inspect --format='{{.State.Health.Status}}' "gluetun-$client" 2>/dev/null)
+        [ "$health" = "healthy" ] && break
+        sleep 2; elapsed=$((elapsed + 2))
+        echo -ne "\r  gluetun: ${DIM}attente healthcheck... ${elapsed}s${NC}   "
+    done
+    if [ "$health" = "healthy" ]; then
+        local ip; ip=$(get_vpn_ip "$client" 2>/dev/null); [ -z "$ip" ] && ip="connecté"
+        echo -e "\r  gluetun: ${GREEN}✔${NC} healthy (IP ${ip})                    "
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "rtorrent-$client"; then
+            echo -e "  rtorrent: ${GREEN}✔${NC} démarré"
+        else
+            echo -e "  rtorrent: ${YELLOW}⏳${NC} démarrage en cours..."
+        fi
+        return 0
+    fi
+    echo -e "\r  gluetun: ${RED}✗${NC} pas healthy après ${STARTUP_HEALTHCHECK_TIMEOUT}s              "
+    echo -e "  ${DIM}     Dernières lignes du log gluetun :${NC}"
+    docker logs --tail 8 "gluetun-$client" 2>&1 | sed 's/^/       /'
+    return 1
+}
+
+cmd_repair() {
+    local CLIENT=$1
+    if [ -z "$CLIENT" ]; then
+        print_header_with_title "RÉPARATION DE TOUS LES CLIENTS"
+        local c ok=0 ko=0
+        for c in $(get_clients); do
+            if _repair_one "$c"; then ok=$((ok + 1)); else ko=$((ko + 1)); fi
+            echo ""
+        done
+        print_success_box "${ok} OK / ${ko} en échec"
+        print_footer
+        return
+    fi
+    if ! client_exists "$CLIENT"; then
+        print_error_box "Le client '${CLIENT}' n'existe pas."
+        return 1
+    fi
+    print_header_with_title "RÉPARATION: ${CLIENT}"
+    _repair_one "$CLIENT"
+    print_footer
+}
+
+interactive_repair_client() {
     print_menu_header
-    
+
     local clients=$(get_clients)
     if [ -z "$clients" ]; then
         echo -e "  ${DIM}Aucun client configuré.${NC}"
         press_enter
         return
     fi
-    
+
+    echo -e "  ${WHITE}RÉPARER UN CLIENT QUI NE DÉMARRE PAS${NC}"
+    line
+    echo ""
+    echo -e "  ${DIM}Nettoie l'état (conteneurs + réseau + port orphelin), remonte le NAS,${NC}"
+    echo -e "  ${DIM}relance et attend que le VPN (gluetun) soit sain.${NC}"
+    echo ""
+    echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
+    echo -e "  ${DIM}(laisser vide pour réparer TOUS les clients)${NC}"
+    echo ""
+    echo -ne "  Nom du client : "
+    read client_name
+
+    cmd_repair "$client_name"
+    press_enter
+}
+
+interactive_stop_client() {
+    print_menu_header
+
+    local clients=$(get_clients)
+    if [ -z "$clients" ]; then
+        echo -e "  ${DIM}Aucun client configuré.${NC}"
+        press_enter
+        return
+    fi
+
     echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
     echo -e "  ${DIM}(laisser vide pour arrêter tous)${NC}"
     echo ""
@@ -6463,17 +6589,18 @@ interactive_maintenance_menu() {
         print_menu_separator
         print_menu_option "7" "-" "Démarrage complet séquentiel"
         print_menu_option "8" "-" "Arrêt complet séquentiel"
+        print_menu_option "9" "-" "Réparer un client qui ne démarre pas"
         print_menu_separator
         local autostart_label="Activer le démarrage auto au boot"
         is_autostart_enabled && autostart_label="Désactiver le démarrage auto au boot ${GREEN}(actif)${NC}"
 
-        print_menu_option "9" "-" "Monter tous les partages NAS"
-        print_menu_option "10" "-" "Optimisation réseau & stockage NFS"
-        print_menu_option "11" "-" "Performance rtorrent (peers / upload)"
-        print_menu_option "12" "-" "Activer / Désactiver le disque SSD temporaire"
-        print_menu_option "13" "-" "$(echo -e "$autostart_label")"
+        print_menu_option "10" "-" "Monter tous les partages NAS"
+        print_menu_option "11" "-" "Optimisation réseau & stockage NFS"
+        print_menu_option "12" "-" "Performance rtorrent (peers / upload)"
+        print_menu_option "13" "-" "Activer / Désactiver le disque SSD temporaire"
+        print_menu_option "14" "-" "$(echo -e "$autostart_label")"
         print_menu_separator
-        print_menu_option "14" "-" "Désinstaller tout"
+        print_menu_option "15" "-" "Désinstaller tout"
         print_menu_separator
         print_menu_option "0" "-" "Retour"
 
@@ -6506,11 +6633,12 @@ interactive_maintenance_menu() {
             6) cmd_start; press_enter ;;
             7) cmd_sequential_start; press_enter ;;
             8) cmd_sequential_stop; press_enter ;;
-            9) cmd_mount; press_enter ;;
-            10) interactive_network_optimize_menu ;;
-            11) interactive_perf_menu ;;
-            12) interactive_temp_toggle ;;
-            13)
+            9) interactive_repair_client ;;
+            10) cmd_mount; press_enter ;;
+            11) interactive_network_optimize_menu ;;
+            12) interactive_perf_menu ;;
+            13) interactive_temp_toggle ;;
+            14)
                 if is_autostart_enabled; then
                     cmd_autostart_disable
                 else
@@ -6518,7 +6646,7 @@ interactive_maintenance_menu() {
                 fi
                 press_enter
                 ;;
-            14) cmd_uninstall; press_enter ;;
+            15) cmd_uninstall; press_enter ;;
             0|q|Q) return ;;
             *) ;;
         esac
@@ -6670,6 +6798,12 @@ case "${1}" in
         parse_args "$@"
         CLIENT="${ARG_USER:-${OTHER_ARGS[0]}}"
         cmd_restart "$CLIENT"
+        ;;
+    repair)
+        shift
+        parse_args "$@"
+        CLIENT="${ARG_USER:-${OTHER_ARGS[0]}}"
+        cmd_repair "$CLIENT"
         ;;
     logs)
         shift
