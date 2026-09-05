@@ -1441,6 +1441,12 @@ func handleAPIBandwidth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Admin sans client précis -> agrégat de TOUS les clients (30 jours).
+	if session.User.Role == "admin" && clientName == "" {
+		json.NewEncoder(w).Encode(aggregateBandwidth(allStats))
+		return
+	}
+
 	clientStats, exists := allStats[clientName]
 	if !exists {
 		json.NewEncoder(w).Encode(BandwidthResponse{
@@ -1454,9 +1460,16 @@ func handleAPIBandwidth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Total affiché = somme des 30 derniers jours (pas le compteur brut cumulatif).
+	var totalDl, totalUl int64
+	for _, h := range clientStats.History {
+		totalDl += h.Download
+		totalUl += h.Upload
+	}
+
 	response := BandwidthResponse{
-		Download:      clientStats.Current["download"],
-		Upload:        clientStats.Current["upload"],
+		Download:      totalDl,
+		Upload:        totalUl,
 		DownloadToday: clientStats.TodayDelta["download"],
 		UploadToday:   clientStats.TodayDelta["upload"],
 		Updated:       clientStats.Updated,
@@ -1464,6 +1477,195 @@ func handleAPIBandwidth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(response)
+}
+
+// ==================== COLLECTE BANDE PASSANTE ====================
+// Lit périodiquement les compteurs de l'interface VPN (wg0) de chaque client
+// via /proc/<pid-gluetun>/net/dev — c'est le namespace réseau du conteneur, donc
+// pas besoin de shell dans gluetun (qui n'en a pas). On accumule des totaux
+// journaliers dans bandwidth-stats.json (30 jours glissants), en gérant les
+// remises à zéro du compteur (redémarrage du conteneur/VPN).
+
+var bandwidthMu sync.Mutex
+
+func readVPNCounters(container string) (int64, int64, bool) {
+	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Pid}}", container).Output()
+	if err != nil {
+		return 0, 0, false
+	}
+	pid := strings.TrimSpace(string(out))
+	if pid == "" || pid == "0" {
+		return 0, 0, false
+	}
+	data, err := os.ReadFile("/proc/" + pid + "/net/dev")
+	if err != nil {
+		return 0, 0, false
+	}
+	// Interface tunnel : wg0 (WireGuard) en priorité, tun0 en repli.
+	for _, want := range []string{"wg0", "tun0"} {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, want+":") {
+				continue
+			}
+			f := strings.Fields(strings.TrimPrefix(line, want+":"))
+			// /proc/net/dev : rx = bytes packets errs drop fifo frame compressed
+			// multicast (8 champs) ; puis tx = bytes ... -> rx=f[0], tx=f[8]
+			if len(f) >= 9 {
+				rx, _ := strconv.ParseInt(f[0], 10, 64)
+				tx, _ := strconv.ParseInt(f[8], 10, 64)
+				return rx, tx, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+func pruneBandwidthHistory(h []BandwidthHistory, days int) []BandwidthHistory {
+	cutoff := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
+	out := make([]BandwidthHistory, 0, len(h))
+	for _, e := range h {
+		if e.Date >= cutoff {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func collectBandwidthOnce() {
+	entries, err := os.ReadDir(CLIENTS_DIR)
+	if err != nil {
+		return
+	}
+	bandwidthMu.Lock()
+	defer bandwidthMu.Unlock()
+
+	allStats := map[string]BandwidthClientStats{}
+	if data, err := os.ReadFile(BANDWIDTH_STATS_FILE); err == nil {
+		json.Unmarshal(data, &allStats)
+	}
+
+	today := time.Now().Format("2006-01-02")
+	nowStr := time.Now().Format("2006-01-02 15:04:05")
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		client := e.Name()
+		if _, err := os.Stat(filepath.Join(CLIENTS_DIR, client, "info.txt")); err != nil {
+			continue
+		}
+		rx, tx, ok := readVPNCounters("gluetun-" + client)
+		if !ok {
+			continue // conteneur arrêté / iface absente -> on garde l'historique tel quel
+		}
+		st := allStats[client]
+		if st.Current == nil {
+			st.Current = map[string]int64{}
+		}
+		if st.TodayDelta == nil {
+			st.TodayDelta = map[string]int64{}
+		}
+
+		// Delta depuis la dernière lecture. Si le compteur a baissé, c'est un
+		// redémarrage (remise à zéro) -> le delta est la nouvelle valeur.
+		var dDl, dUl int64
+		if last, ok := st.Current["download"]; ok {
+			if rx >= last {
+				dDl = rx - last
+			} else {
+				dDl = rx
+			}
+		}
+		if last, ok := st.Current["upload"]; ok {
+			if tx >= last {
+				dUl = tx - last
+			} else {
+				dUl = tx
+			}
+		}
+
+		if st.TodayDate != today {
+			st.TodayDate = today
+			st.TodayDelta = map[string]int64{"download": 0, "upload": 0}
+		}
+		st.TodayDelta["download"] += dDl
+		st.TodayDelta["upload"] += dUl
+
+		st.Current["download"] = rx
+		st.Current["upload"] = tx
+		st.Updated = nowStr
+
+		found := false
+		for i := range st.History {
+			if st.History[i].Date == today {
+				st.History[i].Download += dDl
+				st.History[i].Upload += dUl
+				found = true
+				break
+			}
+		}
+		if !found {
+			st.History = append(st.History, BandwidthHistory{Date: today, Download: dDl, Upload: dUl})
+		}
+		st.History = pruneBandwidthHistory(st.History, 30)
+		allStats[client] = st
+	}
+
+	// Écriture atomique (tmp + rename).
+	if data, err := json.MarshalIndent(allStats, "", "  "); err == nil {
+		tmp := BANDWIDTH_STATS_FILE + ".tmp"
+		if os.WriteFile(tmp, data, 0644) == nil {
+			os.Rename(tmp, BANDWIDTH_STATS_FILE)
+		}
+	}
+}
+
+func startBandwidthCollector() {
+	go func() {
+		collectBandwidthOnce()
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			collectBandwidthOnce()
+		}
+	}()
+}
+
+// aggregateBandwidth additionne l'historique de TOUS les clients (vue admin).
+func aggregateBandwidth(all map[string]BandwidthClientStats) BandwidthResponse {
+	byDate := map[string]*BandwidthHistory{}
+	var totalDl, totalUl, todayDl, todayUl int64
+	latest := ""
+	for _, st := range all {
+		todayDl += st.TodayDelta["download"]
+		todayUl += st.TodayDelta["upload"]
+		if st.Updated > latest {
+			latest = st.Updated
+		}
+		for _, h := range st.History {
+			totalDl += h.Download
+			totalUl += h.Upload
+			e, ok := byDate[h.Date]
+			if !ok {
+				e = &BandwidthHistory{Date: h.Date}
+				byDate[h.Date] = e
+			}
+			e.Download += h.Download
+			e.Upload += h.Upload
+		}
+	}
+	hist := make([]BandwidthHistory, 0, len(byDate))
+	for _, e := range byDate {
+		hist = append(hist, *e)
+	}
+	sort.Slice(hist, func(i, j int) bool { return hist[i].Date < hist[j].Date })
+	return BandwidthResponse{
+		Download: totalDl, Upload: totalUl,
+		DownloadToday: todayDl, UploadToday: todayUl,
+		Updated: latest, History: hist,
+	}
 }
 
 func main() {
@@ -1483,6 +1685,8 @@ func main() {
 	startDataCollector()
 	log.Println("Démarrage du vérificateur d'abonnements...")
 	startSubscriptionChecker()
+	log.Println("Démarrage du collecteur de bande passante...")
+	startBandwidthCollector()
 
 	http.HandleFunc("/login", handleLogin)
 	http.HandleFunc("/logout", handleLogout)

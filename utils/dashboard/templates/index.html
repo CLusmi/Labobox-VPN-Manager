@@ -2683,11 +2683,22 @@
         }
 
         // ==================== AUTO REFRESH (30s sync) ====================
+        // Le rafraîchissement se fait par reload de page. On NE recharge PAS
+        // pendant que l'utilisateur saisit quelque chose (modal ouvert ou champ
+        // focalisé) : sinon la saisie en cours (ex. valider un paiement) serait
+        // effacée. Tant que l'utilisateur est occupé, on reporte le reload.
+        function userIsBusy() {
+            if (document.querySelector('.modal-overlay.active')) return true;
+            const ae = document.activeElement;
+            if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' ||
+                       ae.tagName === 'SELECT' || ae.isContentEditable)) return true;
+            return false;
+        }
         function scheduleNextRefresh() {
             const now = new Date();
             const seconds = now.getSeconds();
             const ms = now.getMilliseconds();
-            
+
             // Calcul du temps jusqu'au prochain :00 ou :30
             let secsUntilNext;
             if (seconds < 30) {
@@ -2695,26 +2706,34 @@
             } else {
                 secsUntilNext = 60 - seconds;
             }
-            
+
             const msUntilNext = (secsUntilNext * 1000) - ms;
-            
+
             // Mise à jour du compte à rebours chaque seconde
             const countdownEl = document.getElementById('countdown');
             let remaining = Math.ceil(msUntilNext / 1000);
-            countdownEl.textContent = remaining;
-            
+            if (countdownEl) countdownEl.textContent = remaining;
+
             const countdownInterval = setInterval(() => {
                 remaining--;
                 if (remaining > 0) {
-                    countdownEl.textContent = remaining;
+                    if (countdownEl) countdownEl.textContent = userIsBusy() ? 'en pause' : remaining;
                 } else {
                     clearInterval(countdownInterval);
                 }
             }, 1000);
-            
-            setTimeout(() => {
-                location.reload();
-            }, msUntilNext);
+
+            // À l'échéance : recharge seulement si l'utilisateur ne saisit rien ;
+            // sinon on retente toutes les 3 s jusqu'à ce qu'il ait fini.
+            function reloadWhenIdle() {
+                if (userIsBusy()) {
+                    if (countdownEl) countdownEl.textContent = 'en pause';
+                    setTimeout(reloadWhenIdle, 3000);
+                } else {
+                    location.reload();
+                }
+            }
+            setTimeout(reloadWhenIdle, msUntilNext);
         }
         scheduleNextRefresh();
 
@@ -2723,7 +2742,9 @@
             setInterval(fetchLiveStats, LIVE_POLL_INTERVAL);
             fetchLiveStats();
         }
-        setInterval(fetchFullData, DATA_POLL_INTERVAL);
+        // NB : le reload de page (scheduleNextRefresh) rafraîchit les données
+        // complètes. On n'appelle plus fetchFullData en boucle : c'était un stub
+        // qui interrogeait /api/data toutes les 5 s (16 docker inspect) pour rien.
     </script>
 
     <!-- Modal Marquer Payé -->
