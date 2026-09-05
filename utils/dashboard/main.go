@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -83,6 +84,15 @@ type BandwidthResponse struct {
 	UploadToday   int64              `json:"upload_today"`
 	Updated       string             `json:"updated"`
 	History       []BandwidthHistory `json:"history"`
+	// Renseigné uniquement pour l'agrégat admin : total par client (30 jours),
+	// trié décroissant, pour le classement « Top consommateurs ».
+	Clients []BandwidthClientTotal `json:"clients,omitempty"`
+}
+
+type BandwidthClientTotal struct {
+	Name     string `json:"name"`
+	Download int64  `json:"download"`
+	Upload   int64  `json:"upload"`
 }
 
 const (
@@ -94,6 +104,7 @@ const (
 	TRACKERS_FILE        = "/opt/laboboxvpn/utils/dashboard/trackers.json"
 	SUBSCRIPTIONS_FILE   = "/opt/laboboxvpn/utils/dashboard/subscriptions.json"
 	BANDWIDTH_STATS_FILE = "/opt/laboboxvpn/utils/dashboard/bandwidth-stats.json"
+	SEEDBOX_CONF         = "/opt/laboboxvpn/laboboxvpn.conf"
 	NAS_MOUNT            = "/mnt/nas"
 	DISCORD_ADMIN_URL    = "https://discord.com/users/clusmi"
 	DEFAULT_LIVE_INTERVAL = 500
@@ -337,12 +348,25 @@ type SystemStats struct {
 	Hostname      string  `json:"hostname"`
 	Uptime        string  `json:"uptime"`
 	LoadAvg       string  `json:"load_avg"`
+	CPUPercent    float64 `json:"cpu_percent"`
+	CPUCount      int     `json:"cpu_count"`
 	MemoryUsed    int64   `json:"memory_used"`
 	MemoryTotal   int64   `json:"memory_total"`
 	MemoryPercent float64 `json:"memory_percent"`
-	DiskUsed      int64   `json:"disk_used"`
-	DiskTotal     int64   `json:"disk_total"`
-	DiskPercent   float64 `json:"disk_percent"`
+	// Disque système de la VM (/).
+	DiskUsed    int64   `json:"disk_used"`
+	DiskTotal   int64   `json:"disk_total"`
+	DiskPercent float64 `json:"disk_percent"`
+	// Espace HDD : NAS Synology monté sur /mnt/nas.
+	NASUsed    int64   `json:"nas_used"`
+	NASTotal   int64   `json:"nas_total"`
+	NASPercent float64 `json:"nas_percent"`
+	NASOnline  bool    `json:"nas_online"`
+	// Espace SSD : disque temporaire (TEMP_DIR de laboboxvpn.conf).
+	SSDUsed       int64   `json:"ssd_used"`
+	SSDTotal      int64   `json:"ssd_total"`
+	SSDPercent    float64 `json:"ssd_percent"`
+	SSDConfigured bool    `json:"ssd_configured"`
 }
 
 type LiveStats struct {
@@ -514,6 +538,30 @@ func getSubscriptionInfo(clientName string) *SubscriptionInfo {
 	}
 }
 
+// suspendMarkerPath : marqueur de suspension d'un client (Option B). Sa présence
+// indique au script (commandes « démarrer/redémarrer tous ») d'ignorer ce client
+// tant qu'il n'a pas payé.
+func suspendMarkerPath(clientName string) string {
+	return filepath.Join(CLIENTS_DIR, clientName, ".suspended")
+}
+
+// startClientContainers relance la seedbox d'un client : gluetun d'abord, puis
+// rtorrent (qui partage le namespace réseau de gluetun). Best-effort — les
+// erreurs sont journalisées sans interrompre l'appelant.
+func startClientContainers(clientName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "docker", "start", "gluetun-"+clientName).CombinedOutput(); err != nil {
+		log.Printf("[SUBSCRIPTIONS] Démarrage gluetun-%s: %v (%s)", clientName, err, strings.TrimSpace(string(out)))
+		return
+	}
+	// Laisser le namespace réseau de gluetun s'établir avant rtorrent.
+	time.Sleep(3 * time.Second)
+	if out, err := exec.CommandContext(ctx, "docker", "start", "rtorrent-"+clientName).CombinedOutput(); err != nil {
+		log.Printf("[SUBSCRIPTIONS] Démarrage rtorrent-%s: %v (%s)", clientName, err, strings.TrimSpace(string(out)))
+	}
+}
+
 func markClientPaid(clientName string, amount float64, dueDate string, method string, note string) error {
 	subs := loadSubscriptions()
 	if subs[clientName] == nil {
@@ -523,7 +571,16 @@ func markClientPaid(clientName string, amount float64, dueDate string, method st
 	subs[clientName].Suspended = false
 	payment := PaymentHistory{Date: time.Now().Format("2006-01-02"), Amount: amount, Method: method, Note: note}
 	subs[clientName].History = append([]PaymentHistory{payment}, subs[clientName].History...)
-	return saveSubscriptions(subs)
+	if err := saveSubscriptions(subs); err != nil {
+		return err
+	}
+	// Option B : lever le marqueur de suspension puis redémarrer automatiquement
+	// la seedbox du client (gluetun + rtorrent).
+	if err := os.Remove(suspendMarkerPath(clientName)); err != nil && !os.IsNotExist(err) {
+		log.Printf("[SUBSCRIPTIONS] Retrait du marqueur de %s: %v", clientName, err)
+	}
+	go startClientContainers(clientName)
+	return nil
 }
 
 func updateSubscriptionDate(clientName string, dueDate string) error {
@@ -541,6 +598,11 @@ func suspendClient(clientName string) error {
 	if subs[clientName] != nil {
 		subs[clientName].Suspended = true
 		saveSubscriptions(subs)
+	}
+	// Option B : poser le marqueur respecté par le script (les commandes
+	// « démarrer/redémarrer tous » sauteront ce client tant qu'il est suspendu).
+	if err := os.WriteFile(suspendMarkerPath(clientName), []byte(time.Now().Format(time.RFC3339)+"\n"), 0644); err != nil {
+		log.Printf("[SUBSCRIPTIONS] Écriture du marqueur de %s: %v", clientName, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -854,6 +916,21 @@ func collectSystem() SystemStats {
 			stats.LoadAvg = strings.Join(fields[:3], " ")
 		}
 	}
+	// CPU : deux échantillons de /proc/stat espacés de 200 ms (le delta busy/total
+	// donne l'occupation instantanée). Ce collecteur tourne en tâche de fond
+	// (toutes les DATA_INTERVAL), la pause ne bloque donc aucune requête.
+	stats.CPUCount = runtime.NumCPU()
+	idle0, total0 := readCPUStat()
+	time.Sleep(200 * time.Millisecond)
+	idle1, total1 := readCPUStat()
+	if total1 > total0 {
+		dTotal := float64(total1 - total0)
+		dIdle := float64(idle1 - idle0)
+		stats.CPUPercent = (dTotal - dIdle) / dTotal * 100
+		if stats.CPUPercent < 0 {
+			stats.CPUPercent = 0
+		}
+	}
 	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
 		var memTotal, memAvailable int64
 		for _, line := range strings.Split(string(data), "\n") {
@@ -871,20 +948,108 @@ func collectSystem() SystemStats {
 			stats.MemoryPercent = float64(stats.MemoryUsed) / float64(memTotal) * 100
 		}
 	}
-	if output, err := exec.Command("df", "-B1", "/").Output(); err == nil {
-		lines := strings.Split(string(output), "\n")
-		if len(lines) >= 2 {
-			fields := strings.Fields(lines[1])
-			if len(fields) >= 4 {
-				stats.DiskTotal, _ = strconv.ParseInt(fields[1], 10, 64)
-				stats.DiskUsed, _ = strconv.ParseInt(fields[2], 10, 64)
-				if stats.DiskTotal > 0 {
-					stats.DiskPercent = float64(stats.DiskUsed) / float64(stats.DiskTotal) * 100
-				}
-			}
+	// Espace VM : disque système (/).
+	if used, total, pct, ok := dfStats("/"); ok {
+		stats.DiskUsed, stats.DiskTotal, stats.DiskPercent = used, total, pct
+	}
+	// Espace HDD : NAS Synology monté sur /mnt/nas (peut être hors ligne). On
+	// vérifie d'abord que c'est bien un point de montage : sinon `df /mnt/nas`
+	// renverrait par erreur les stats du disque racine (dossier vide sur /).
+	if isMounted(NAS_MOUNT) {
+		if used, total, pct, ok := dfStats(NAS_MOUNT); ok && total > 0 {
+			stats.NASUsed, stats.NASTotal, stats.NASPercent = used, total, pct
+			stats.NASOnline = true
+		}
+	}
+	// Espace SSD : disque temporaire TEMP_DIR (laboboxvpn.conf) s'il est configuré.
+	if tempDir := readTempDir(); tempDir != "" {
+		stats.SSDConfigured = true
+		if used, total, pct, ok := dfStats(tempDir); ok {
+			stats.SSDUsed, stats.SSDTotal, stats.SSDPercent = used, total, pct
 		}
 	}
 	return stats
+}
+
+// readCPUStat lit la ligne agrégée « cpu » de /proc/stat et renvoie le temps
+// inactif (idle+iowait) et le temps total, en jiffies.
+func readCPUStat() (idle, total uint64) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "cpu ") {
+			for i, f := range strings.Fields(line)[1:] {
+				v, _ := strconv.ParseUint(f, 10, 64)
+				total += v
+				if i == 3 || i == 4 { // idle, iowait
+					idle += v
+				}
+			}
+			return
+		}
+	}
+	return
+}
+
+// dfStats renvoie l'espace utilisé/total (octets) et le pourcentage d'un point
+// de montage via `df`. Un timeout court évite de bloquer le collecteur si un
+// montage réseau (NAS NFS) est gelé.
+func dfStats(path string) (used, total int64, pct float64, ok bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "df", "-B1", path).Output()
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(output), "\n")
+	if len(lines) < 2 {
+		return
+	}
+	fields := strings.Fields(lines[1])
+	if len(fields) < 4 {
+		return
+	}
+	total, _ = strconv.ParseInt(fields[1], 10, 64)
+	used, _ = strconv.ParseInt(fields[2], 10, 64)
+	if total > 0 {
+		pct = float64(used) / float64(total) * 100
+	}
+	ok = true
+	return
+}
+
+// isMounted indique si `path` est un véritable point de montage (présent dans
+// /proc/mounts). Sert à distinguer un NAS réellement monté d'un dossier vide.
+func isMounted(path string) bool {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[1] == path {
+			return true
+		}
+	}
+	return false
+}
+
+// readTempDir extrait la valeur de TEMP_DIR (chemin du SSD temporaire) depuis la
+// config du gestionnaire (laboboxvpn.conf). Vide = SSD non configuré.
+func readTempDir() string {
+	data, err := os.ReadFile(SEEDBOX_CONF)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "TEMP_DIR=") {
+			return strings.TrimSpace(strings.Trim(strings.TrimPrefix(line, "TEMP_DIR="), "\"'"))
+		}
+	}
+	return ""
 }
 
 var allowedActions = map[string]bool{
@@ -937,7 +1102,7 @@ func executeAction(req ActionRequest, user *AuthUser) ActionResponse {
 		if err := markClientPaid(req.Target, amount, req.Params["due_date"], req.Params["method"], req.Params["note"]); err != nil {
 			return ActionResponse{Success: false, Message: fmt.Sprintf("Erreur: %v", err)}
 		}
-		return ActionResponse{Success: true, Message: fmt.Sprintf("Paiement enregistré pour %s", req.Target)}
+		return ActionResponse{Success: true, Message: fmt.Sprintf("Paiement enregistré pour %s — redémarrage de la seedbox en cours", req.Target)}
 	case "update-subscription":
 		if req.Target == "" {
 			return ActionResponse{Success: false, Message: "Client requis"}
@@ -1638,15 +1803,17 @@ func aggregateBandwidth(all map[string]BandwidthClientStats) BandwidthResponse {
 	byDate := map[string]*BandwidthHistory{}
 	var totalDl, totalUl, todayDl, todayUl int64
 	latest := ""
-	for _, st := range all {
+	clients := make([]BandwidthClientTotal, 0, len(all))
+	for name, st := range all {
 		todayDl += st.TodayDelta["download"]
 		todayUl += st.TodayDelta["upload"]
 		if st.Updated > latest {
 			latest = st.Updated
 		}
+		var cDl, cUl int64
 		for _, h := range st.History {
-			totalDl += h.Download
-			totalUl += h.Upload
+			cDl += h.Download
+			cUl += h.Upload
 			e, ok := byDate[h.Date]
 			if !ok {
 				e = &BandwidthHistory{Date: h.Date}
@@ -1655,16 +1822,23 @@ func aggregateBandwidth(all map[string]BandwidthClientStats) BandwidthResponse {
 			e.Download += h.Download
 			e.Upload += h.Upload
 		}
+		totalDl += cDl
+		totalUl += cUl
+		clients = append(clients, BandwidthClientTotal{Name: name, Download: cDl, Upload: cUl})
 	}
 	hist := make([]BandwidthHistory, 0, len(byDate))
 	for _, e := range byDate {
 		hist = append(hist, *e)
 	}
 	sort.Slice(hist, func(i, j int) bool { return hist[i].Date < hist[j].Date })
+	// Classement décroissant par volume total (download + upload).
+	sort.Slice(clients, func(i, j int) bool {
+		return clients[i].Download+clients[i].Upload > clients[j].Download+clients[j].Upload
+	})
 	return BandwidthResponse{
 		Download: totalDl, Upload: totalUl,
 		DownloadToday: todayDl, UploadToday: todayUl,
-		Updated: latest, History: hist,
+		Updated: latest, History: hist, Clients: clients,
 	}
 }
 

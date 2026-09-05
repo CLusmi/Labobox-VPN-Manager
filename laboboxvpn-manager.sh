@@ -1476,6 +1476,14 @@ cmd_status() {
 ###########################################
 # COMMANDE: START
 ###########################################
+# Un client « suspendu » porte le marqueur clients/<client>/.suspended, posé par
+# le dashboard à l'échéance impayée. Les commandes groupées (démarrer/redémarrer
+# tous, démarrage séquentiel) sautent ce client tant qu'il n'a pas payé. Le
+# marqueur est levé par « Marquer payé » (dashboard), qui relance alors le client.
+is_suspended() {
+    [ -f "${CLIENTS_DIR}/$1/.suspended" ]
+}
+
 cmd_start() {
     local CLIENT=$1
     
@@ -1485,6 +1493,10 @@ cmd_start() {
         
         local count=0
         for client in $(get_clients); do
+            if is_suspended "$client"; then
+                echo -e "  ${YELLOW}⏸${NC} ${client} suspendu (non payé) — ignoré"
+                continue
+            fi
             mount_nas_for_client "$client" 2>/dev/null || true
             cd "$CLIENTS_DIR/$client"
             echo -ne "  ${DIM}Démarrage de ${client}...${NC}"
@@ -1577,6 +1589,10 @@ cmd_restart() {
         
         local count=0
         for client in $(get_clients); do
+            if is_suspended "$client"; then
+                echo -e "  ${YELLOW}⏸${NC} ${client} suspendu (non payé) — ignoré"
+                continue
+            fi
             mount_nas_for_client "$client" 2>/dev/null || true
             cd "$CLIENTS_DIR/$client"
             echo -ne "  ${DIM}Redémarrage de ${client}...${NC}"
@@ -3303,6 +3319,12 @@ cmd_sequential_start() {
         [ -z "$client" ] && continue
         ((current++))
         
+        if is_suspended "$client"; then
+            echo -e "  ${WHITE}[${current}/${client_count}] ${client}${NC} ${YELLOW}⏸ suspendu (non payé) — ignoré${NC}"
+            echo ""
+            continue
+        fi
+
         local port_rt=$(grep "PORT_RTORRENT_VPN" "$CLIENTS_DIR/$client/info.txt" 2>/dev/null | cut -d: -f2 | tr -d ' ')
         
         echo -e "  ${WHITE}[${current}/${client_count}] ${client}${NC} ${DIM}(WebUI: ${port}, RT: ${port_rt})${NC}"

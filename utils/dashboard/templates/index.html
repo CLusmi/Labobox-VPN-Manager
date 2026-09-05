@@ -1349,6 +1349,66 @@
             margin-top: 0.5rem;
         }
 
+        /* ==================== STATISTIQUES (Top conso + Disques) ==================== */
+        .stats-grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+        @media (max-width: 1000px) {
+            .stats-grid-2 { grid-template-columns: 1fr; }
+        }
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            padding: 1.25rem;
+        }
+        .stat-card-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 1rem;
+            margin-bottom: 1.1rem;
+        }
+        .stat-card-title { font-size: 0.95rem; font-weight: 600; }
+        .stat-card-sub { font-size: 0.75rem; color: var(--text-muted); margin-top: 2px; }
+        .stat-total { text-align: right; flex: none; }
+        .stat-total-label { font-size: 0.65rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; }
+        .stat-total-value { font-family: 'JetBrains Mono', monospace; font-size: 1.15rem; font-weight: 600; line-height: 1.2; margin-top: 2px; }
+        .stat-total-detail { font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; margin-top: 2px; }
+        .stat-empty { font-size: 0.8rem; color: var(--text-muted); padding: 0.5rem 0; }
+
+        .cons-list { display: flex; flex-direction: column; gap: 0.9rem; }
+        .cons-name { display: flex; align-items: baseline; gap: 0.5rem; margin-bottom: 0.35rem; }
+        .cons-rank { color: var(--text-muted); font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; width: 12px; }
+        .cons-who { font-weight: 550; font-size: 0.85rem; }
+        .cons-vals { margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; }
+        .cons-vals .dl { color: var(--accent-cyan); }
+        .cons-vals .ul { color: var(--accent-green); margin-left: 0.6rem; }
+        .cons-bar { height: 6px; border-radius: 4px; background: var(--bg-secondary); overflow: hidden; }
+        .cons-bar + .cons-bar { margin-top: 3px; }
+        .cons-bar > span { display: block; height: 100%; border-radius: 4px; }
+        .cons-bar.dl > span { background: var(--accent-cyan); }
+        .cons-bar.ul > span { background: var(--accent-green); }
+        .cons-legend { display: flex; gap: 1rem; margin-top: 1rem; font-size: 0.72rem; color: var(--text-secondary); }
+        .cons-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 3px; margin-right: 5px; }
+        .cons-legend .dot-dl { background: var(--accent-cyan); }
+        .cons-legend .dot-ul { background: var(--accent-green); }
+
+        .disk-meters { display: flex; flex-direction: column; gap: 1rem; }
+        .disk-meter-lab { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.35rem; font-size: 0.8rem; }
+        .disk-meter-k { color: var(--text-secondary); }
+        .disk-meter-v { font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: var(--accent-green); }
+        .disk-meter-v.warn { color: var(--accent-amber); }
+        .disk-meter-v.danger { color: var(--accent-red); }
+        .disk-meter-v.off { color: var(--text-muted); }
+        .disk-meter-bar { height: 8px; border-radius: 5px; background: var(--bg-secondary); overflow: hidden; }
+        .disk-meter-fill { height: 100%; border-radius: 5px; background: var(--accent-green); transition: width 0.5s ease; }
+        .disk-meter-fill.warning { background: var(--accent-amber); }
+        .disk-meter-fill.danger { background: var(--accent-red); }
+        .disk-meter-note { margin-top: 0.35rem; font-size: 0.7rem; color: var(--text-muted); }
+
         /* ==================== TOAST NOTIFICATIONS ==================== */
         .toast-container {
             position: fixed;
@@ -2468,37 +2528,102 @@
         {{end}}
 
         {{if and .IsAdmin (not .ViewAsClient)}}
+        <!-- Section Statistiques (Admin) : Top consommateurs + État des disques -->
+        <section class="section">
+            <div class="section-header">
+                <div class="section-title">
+                    <div class="section-title-icon">📊</div>
+                    Statistiques
+                </div>
+            </div>
+
+            <div class="stats-grid-2">
+                <!-- Top consommateurs -->
+                <div class="stat-card">
+                    <div class="stat-card-head">
+                        <div>
+                            <div class="stat-card-title">Top consommateurs</div>
+                            <div class="stat-card-sub">Bande passante · 30 derniers jours</div>
+                        </div>
+                        <div class="stat-total">
+                            <div class="stat-total-label">Total colocation</div>
+                            <div class="stat-total-value" id="cons-total">—</div>
+                            <div class="stat-total-detail" id="cons-total-detail"></div>
+                        </div>
+                    </div>
+                    <div class="cons-list" id="cons-list">
+                        <div class="stat-empty">Chargement…</div>
+                    </div>
+                    <div class="cons-legend">
+                        <span><i class="dot-dl"></i>↓ Reçu</span>
+                        <span><i class="dot-ul"></i>↑ Envoyé</span>
+                    </div>
+                </div>
+
+                <!-- État des disques -->
+                <div class="stat-card">
+                    <div class="stat-card-head">
+                        <div>
+                            <div class="stat-card-title">État des disques</div>
+                            <div class="stat-card-sub">État des disques connectés sur cette VM</div>
+                        </div>
+                    </div>
+                    <div class="disk-meters">
+                        <div class="disk-meter">
+                            <div class="disk-meter-lab">
+                                <span class="disk-meter-k">Espace HDD</span>
+                                {{if .System.NASOnline}}<span class="disk-meter-v {{if gt .System.NASPercent 80.0}}warn{{end}}{{if gt .System.NASPercent 90.0}} danger{{end}}">{{printf "%.0f" .System.NASPercent}}%</span>{{else}}<span class="disk-meter-v off">hors ligne</span>{{end}}
+                            </div>
+                            <div class="disk-meter-bar"><div class="disk-meter-fill {{if gt .System.NASPercent 80.0}}warning{{end}}{{if gt .System.NASPercent 90.0}} danger{{end}}" style="width: {{if .System.NASOnline}}{{printf "%.0f" .System.NASPercent}}{{else}}0{{end}}%"></div></div>
+                            <div class="disk-meter-note">{{if .System.NASOnline}}{{formatBytes .System.NASUsed}} / {{formatBytes .System.NASTotal}}{{else}}NAS non monté sur /mnt/nas{{end}}</div>
+                        </div>
+                        {{if .System.SSDConfigured}}
+                        <div class="disk-meter">
+                            <div class="disk-meter-lab">
+                                <span class="disk-meter-k">Espace SSD</span>
+                                <span class="disk-meter-v {{if gt .System.SSDPercent 80.0}}warn{{end}}{{if gt .System.SSDPercent 90.0}} danger{{end}}">{{printf "%.0f" .System.SSDPercent}}%</span>
+                            </div>
+                            <div class="disk-meter-bar"><div class="disk-meter-fill {{if gt .System.SSDPercent 80.0}}warning{{end}}{{if gt .System.SSDPercent 90.0}} danger{{end}}" style="width: {{printf "%.0f" .System.SSDPercent}}%"></div></div>
+                            <div class="disk-meter-note">{{formatBytes .System.SSDUsed}} / {{formatBytes .System.SSDTotal}} en transit</div>
+                        </div>
+                        {{end}}
+                        <div class="disk-meter">
+                            <div class="disk-meter-lab">
+                                <span class="disk-meter-k">Espace VM</span>
+                                <span class="disk-meter-v {{if gt .System.DiskPercent 80.0}}warn{{end}}{{if gt .System.DiskPercent 90.0}} danger{{end}}">{{printf "%.0f" .System.DiskPercent}}%</span>
+                            </div>
+                            <div class="disk-meter-bar"><div class="disk-meter-fill {{if gt .System.DiskPercent 80.0}}warning{{end}}{{if gt .System.DiskPercent 90.0}} danger{{end}}" style="width: {{printf "%.0f" .System.DiskPercent}}%"></div></div>
+                            <div class="disk-meter-note">{{formatBytes .System.DiskUsed}} / {{formatBytes .System.DiskTotal}}</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+        {{end}}
+
+        {{if and .IsAdmin (not .ViewAsClient)}}
         <!-- Section Système (Admin uniquement) -->
         <section class="section">
             <div class="section-header">
                 <div class="section-title">
                     <div class="section-title-icon">💻</div>
-                    Système
+                    Système — {{.System.Hostname}}
                 </div>
             </div>
             
             <div class="system-grid">
                 <div class="system-card">
                     <div class="system-card-header">
-                        <div class="system-card-icon">🖥</div>
-                        <span class="system-card-title">Hostname</span>
+                        <div class="system-card-icon">⚙️</div>
+                        <span class="system-card-title">CPU</span>
                     </div>
-                    <div class="system-card-value">{{.System.Hostname}}</div>
-                    <div class="system-card-detail">Uptime: {{.System.Uptime}}</div>
-                </div>
-                
-                <div class="system-card">
-                    <div class="system-card-header">
-                        <div class="system-card-icon">💿</div>
-                        <span class="system-card-title">Disque</span>
-                    </div>
-                    <div class="system-card-value">{{printf "%.0f" .System.DiskPercent}}%</div>
+                    <div class="system-card-value">{{printf "%.0f" .System.CPUPercent}}%</div>
                     <div class="system-card-bar">
-                        <div class="system-card-bar-fill {{if gt .System.DiskPercent 80.0}}warning{{end}} {{if gt .System.DiskPercent 90.0}}danger{{end}}" style="width: {{.System.DiskPercent}}%"></div>
+                        <div class="system-card-bar-fill {{if gt .System.CPUPercent 80.0}}warning{{end}} {{if gt .System.CPUPercent 90.0}}danger{{end}}" style="width: {{.System.CPUPercent}}%"></div>
                     </div>
-                    <div class="system-card-detail">{{formatBytes .System.DiskUsed}} / {{formatBytes .System.DiskTotal}}</div>
+                    <div class="system-card-detail">{{.System.CPUCount}} vCPU</div>
                 </div>
-                
+
                 <div class="system-card">
                     <div class="system-card-header">
                         <div class="system-card-icon">💾</div>
@@ -2508,9 +2633,9 @@
                     <div class="system-card-bar">
                         <div class="system-card-bar-fill {{if gt .System.MemoryPercent 80.0}}warning{{end}} {{if gt .System.MemoryPercent 90.0}}danger{{end}}" style="width: {{.System.MemoryPercent}}%"></div>
                     </div>
-                    <div class="system-card-detail">{{formatBytes .System.MemoryUsed}} / {{formatBytes .System.MemoryTotal}}</div>
+                    <div class="system-card-detail">{{formatBytes .System.MemoryUsed}} / {{formatBytes .System.MemoryTotal}} · hors cache</div>
                 </div>
-                
+
                 <div class="system-card">
                     <div class="system-card-header">
                         <div class="system-card-icon">📊</div>
@@ -2518,6 +2643,15 @@
                     </div>
                     <div class="system-card-value" style="font-size: 1.2rem;">{{.System.LoadAvg}}</div>
                     <div class="system-card-detail">1min / 5min / 15min</div>
+                </div>
+
+                <div class="system-card">
+                    <div class="system-card-header">
+                        <div class="system-card-icon">⏱</div>
+                        <span class="system-card-title">Uptime</span>
+                    </div>
+                    <div class="system-card-value" style="font-size: 1.2rem;">{{.System.Uptime}}</div>
+                    <div class="system-card-detail">{{len .Clients}} clients</div>
                 </div>
             </div>
         </section>
@@ -2756,7 +2890,7 @@
             </div>
             <div class="modal-field">
                 <label class="modal-label">Montant reçu (€)</label>
-                <input type="number" class="modal-input" id="pay-amount" value="15" step="0.01">
+                <input type="number" class="modal-input" id="pay-amount" value="" step="0.01">
             </div>
             <div class="modal-field">
                 <label class="modal-label">Prolonger jusqu'au</label>
@@ -2868,7 +3002,7 @@
     function openPayModal(clientName) {
         currentPayClient = clientName;
         document.getElementById('pay-client-name').textContent = clientName;
-        document.getElementById('pay-amount').value = '15';
+        document.getElementById('pay-amount').value = '';
         document.getElementById('pay-note').value = '';
         populateDateSelects('pay-day', 'pay-month', 'pay-year', null);
         document.getElementById('modal-pay').classList.add('active');
@@ -3102,6 +3236,51 @@
         return `${day} ${month}`;
     }
 
+    function escHtml(s) {
+        return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    // Top consommateurs (vue admin) : agrégat colocation + classement top 3.
+    async function fetchTopConsumers() {
+        const list = document.getElementById('cons-list');
+        if (!list) return; // pas la vue admin
+        try {
+            const response = await fetch('/api/bandwidth'); // admin sans client = agrégat
+            if (!response.ok) return;
+            const data = await response.json();
+
+            const dl = data.download || 0, ul = data.upload || 0;
+            document.getElementById('cons-total').textContent =
+                `${formatBytesShort(dl + ul)} ${formatBytesUnit(dl + ul)}`;
+            document.getElementById('cons-total-detail').innerHTML =
+                `<span style="color:var(--accent-cyan)">↓ ${formatBytesShort(dl)}</span> ` +
+                `<span style="color:var(--accent-green)">↑ ${formatBytesShort(ul)} ${formatBytesUnit(ul)}</span>`;
+
+            const clients = (data.clients || []).filter(c => (c.download || 0) + (c.upload || 0) > 0).slice(0, 3);
+            if (clients.length === 0) {
+                list.innerHTML = '<div class="stat-empty">Aucune donnée de bande passante pour le moment.</div>';
+                return;
+            }
+            const max = Math.max(1, ...clients.map(c => Math.max(c.download || 0, c.upload || 0)));
+            list.innerHTML = clients.map((c, i) => {
+                const cdl = c.download || 0, cul = c.upload || 0;
+                const wdl = Math.round((cdl / max) * 100), wul = Math.round((cul / max) * 100);
+                return `
+                <div class="cons-row">
+                    <div class="cons-name">
+                        <span class="cons-rank">${i + 1}</span>
+                        <span class="cons-who">${escHtml(c.name)}</span>
+                        <span class="cons-vals"><span class="dl">↓ ${formatBytesShort(cdl)} ${formatBytesUnit(cdl)}</span><span class="ul">↑ ${formatBytesShort(cul)} ${formatBytesUnit(cul)}</span></span>
+                    </div>
+                    <div class="cons-bar dl"><span style="width:${wdl}%"></span></div>
+                    <div class="cons-bar ul"><span style="width:${wul}%"></span></div>
+                </div>`;
+            }).join('');
+        } catch (err) {
+            console.error('Erreur fetch top consommateurs:', err);
+        }
+    }
+
     async function fetchBandwidthStats() {
         const bandwidthCard = document.getElementById('bandwidth-card');
         if (!bandwidthCard) return; // Pas de carte = pas client
@@ -3133,8 +3312,10 @@
     // Charger les stats de bande passante au démarrage
     document.addEventListener('DOMContentLoaded', function() {
         fetchBandwidthStats();
+        fetchTopConsumers();
         // Rafraîchir toutes les 5 minutes
         setInterval(fetchBandwidthStats, 5 * 60 * 1000);
+        setInterval(fetchTopConsumers, 2 * 60 * 1000);
     });
     </script>
 </body>
