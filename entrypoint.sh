@@ -598,6 +598,9 @@ log "[\$HASH] copie SSD -> NAS (seed en cours): \$SRC -> \$DEST/"
 # chemin en dur (un /usr/bin/cp code en dur = "not found" => copie ratee =>
 # fichier non deplace). A defaut de cp GNU : copie simple puis restauration
 # des mtime avec touch -r (100% portable busybox).
+# Mesure taille + duree pour le journal (taille lue sur la source SSD).
+SIZE_KB=\$(du -sk "\$SRC" 2>/dev/null | awk '{print \$1}')
+T0=\$(date +%s)
 copy_ok=1
 if cp --version 2>/dev/null | grep -qi coreutils; then
     cp -r --preserve=mode,timestamps "\$SRC" "\$DEST/" 2>>"\$LOG" && copy_ok=0
@@ -609,7 +612,14 @@ elif cp -r "\$SRC" "\$DEST/" 2>>"\$LOG"; then
     fi
     copy_ok=0
 fi
+T1=\$(date +%s)
 if [ "\$copy_ok" = 0 ]; then
+    # Debit de la copie SSD -> NAS (temps de la copie seule, hors bascule RPC).
+    # C'est le debit d'ECRITURE cote NAS (HDD via NFS), quasi toujours le
+    # goulot ; la lecture depuis le SSD est bien plus rapide. Pour un bench
+    # brut SSD vs NAS separement, voir le menu Benchmarks.
+    ELAPSED=\$((T1 - T0)); [ "\$ELAPSED" -lt 1 ] && ELAPSED=1
+    log "[\$HASH] copie SSD->NAS: \$(awk -v k="\$SIZE_KB" -v t="\$ELAPSED" 'BEGIN{gb=k/1048576;mb=k/1024;printf "%.2f Go en %ds (%.0f Mo/s ecriture NAS)", gb, t, mb/t}')"
     # Donnees a plat sur le NAS : bascule breve (torrent seedait -> rien a vider)
     rpc d.stop "\$HASH"
     rpc d.close "\$HASH"
