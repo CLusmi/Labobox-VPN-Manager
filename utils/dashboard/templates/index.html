@@ -1364,19 +1364,11 @@
             border-radius: var(--radius-lg);
             padding: 1.25rem;
         }
-        .stat-card-head {
-            display: flex;
-            align-items: flex-start;
-            justify-content: space-between;
-            gap: 1rem;
-            margin-bottom: 1.1rem;
-        }
+        .stat-card-head { margin-bottom: 1.1rem; }
         .stat-card-title { font-size: 0.95rem; font-weight: 600; }
         .stat-card-sub { font-size: 0.75rem; color: var(--text-muted); margin-top: 2px; }
-        .stat-total { text-align: right; flex: none; }
-        .stat-total-label { font-size: 0.65rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; }
-        .stat-total-value { font-family: 'JetBrains Mono', monospace; font-size: 1.15rem; font-weight: 600; line-height: 1.2; margin-top: 2px; }
-        .stat-total-detail { font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; margin-top: 2px; }
+        .cons-total-line { margin-top: 0.6rem; font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; }
+        .cons-total-line .ctl-lbl { color: var(--text-muted); }
         .stat-empty { font-size: 0.8rem; color: var(--text-muted); padding: 0.5rem 0; }
 
         .cons-list { display: flex; flex-direction: column; gap: 0.9rem; }
@@ -2541,15 +2533,9 @@
                 <!-- Top consommateurs -->
                 <div class="stat-card">
                     <div class="stat-card-head">
-                        <div>
-                            <div class="stat-card-title">Top consommateurs</div>
-                            <div class="stat-card-sub">Bande passante · 30 derniers jours</div>
-                        </div>
-                        <div class="stat-total">
-                            <div class="stat-total-label">Total colocation</div>
-                            <div class="stat-total-value" id="cons-total">—</div>
-                            <div class="stat-total-detail" id="cons-total-detail"></div>
-                        </div>
+                        <div class="stat-card-title">Top consommateurs</div>
+                        <div class="stat-card-sub">Bande passante · 30 derniers jours</div>
+                        <div class="cons-total-line" id="cons-total-line"><span class="ctl-lbl">Total colocation :</span> —</div>
                     </div>
                     <div class="cons-list" id="cons-list">
                         <div class="stat-empty">Chargement…</div>
@@ -2607,7 +2593,7 @@
             <div class="section-header">
                 <div class="section-title">
                     <div class="section-title-icon">💻</div>
-                    Système — {{.System.Hostname}}
+                    Système
                 </div>
             </div>
             
@@ -3249,12 +3235,12 @@
             if (!response.ok) return;
             const data = await response.json();
 
-            const dl = data.download || 0, ul = data.upload || 0;
-            document.getElementById('cons-total').textContent =
-                `${formatBytesShort(dl + ul)} ${formatBytesUnit(dl + ul)}`;
-            document.getElementById('cons-total-detail').innerHTML =
-                `<span style="color:var(--accent-cyan)">↓ ${formatBytesShort(dl)}</span> ` +
-                `<span style="color:var(--accent-green)">↑ ${formatBytesShort(ul)} ${formatBytesUnit(ul)}</span>`;
+            const dl = data.download || 0, ul = data.upload || 0, tot = dl + ul;
+            document.getElementById('cons-total-line').innerHTML =
+                `<span class="ctl-lbl">Total colocation :</span> ` +
+                `<span style="color:var(--accent-cyan)">↓ ${formatBytesShort(dl)} ${formatBytesUnit(dl)}</span>` +
+                ` / <span style="color:var(--accent-green)">↑ ${formatBytesShort(ul)} ${formatBytesUnit(ul)}</span>` +
+                ` → <span style="color:var(--text-primary);font-weight:600">${formatBytesShort(tot)} ${formatBytesUnit(tot)}</span>`;
 
             const clients = (data.clients || []).filter(c => (c.download || 0) + (c.upload || 0) > 0).slice(0, 3);
             if (clients.length === 0) {
