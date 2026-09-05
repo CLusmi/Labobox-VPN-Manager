@@ -585,15 +585,31 @@ fi
 mkdir -p "\$DEST"
 log "[\$HASH] copie SSD -> NAS (seed en cours): \$SRC -> \$DEST/"
 
-# Copie en PRESERVANT le mtime (et le mode), mais PAS le proprietaire :
-#  - mtime preserve => rtorrent retrouve son fast-resume (taille + mtime
-#    identiques) et NE re-hash PAS le torrent apres le deplacement. Sans ca,
-#    il relit tout le fichier depuis le NAS pour verifier -> lent + inutile.
-#  - proprietaire non touche => pas d'echec chown sur NFS en non-root
-#    (« Operation not permitted »). Les fichiers appartiennent au client.
-# cp GNU (coreutils) pour --preserve granulaire ; chemin explicite pour ne
-# pas tomber sur le cp busybox.
-if /usr/bin/cp -r --preserve=mode,timestamps "\$SRC" "\$DEST/" 2>>"\$LOG"; then
+# Copie SSD -> NAS. Deux exigences :
+#  1) PRESERVER LE MTIME : le fast-resume de rtorrent valide chaque fichier
+#     sur (taille + mtime). Un mtime different => rtorrent croit les donnees
+#     modifiees et re-hash tout le fichier (lent, inutile). On preserve donc
+#     le mtime pour que le seed reprenne tout de suite depuis le NAS.
+#  2) NE PAS TOUCHER AU PROPRIETAIRE : un chown echoue sur NFS en non-root
+#     (« Operation not permitted ») et ferait echouer la copie.
+# cp GNU (coreutils, present dans l'image) fait les deux en une passe via
+# --preserve=mode,timestamps. ATTENTION : sur Alpine, coreutils installe cp
+# en /bin/cp (PAS /usr/bin/cp) -> on appelle « cp » via le PATH, jamais un
+# chemin en dur (un /usr/bin/cp code en dur = "not found" => copie ratee =>
+# fichier non deplace). A defaut de cp GNU : copie simple puis restauration
+# des mtime avec touch -r (100% portable busybox).
+copy_ok=1
+if cp --version 2>/dev/null | grep -qi coreutils; then
+    cp -r --preserve=mode,timestamps "\$SRC" "\$DEST/" 2>>"\$LOG" && copy_ok=0
+elif cp -r "\$SRC" "\$DEST/" 2>>"\$LOG"; then
+    if [ -d "\$SRC" ]; then
+        ( cd "\$SRC" && find . -exec touch -r "{}" "\$DEST/\$BASE/{}" \; ) 2>>"\$LOG"
+    else
+        touch -r "\$SRC" "\$DEST/\$BASE" 2>>"\$LOG"
+    fi
+    copy_ok=0
+fi
+if [ "\$copy_ok" = 0 ]; then
     # Donnees a plat sur le NAS : bascule breve (torrent seedait -> rien a vider)
     rpc d.stop "\$HASH"
     rpc d.close "\$HASH"
