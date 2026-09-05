@@ -582,33 +582,52 @@ if [ ! -e "\$SRC" ]; then
     exit 1
 fi
 
-mkdir -p "\$DEST"
-log "[\$HASH] copie SSD -> NAS (seed en cours): \$SRC -> \$DEST/"
+# Emplacement final. Un torrent MULTI-FICHIERS possede un dossier racine (son
+# nom) ; rtorrent avait deja ajoute ce nom a d.directory a l'ajout, donc
+# labobox_dest vaut categorie/Nom. Copier la source DANS labobox_dest donnerait
+# categorie/Nom/Nom/... (dossier en double). On retire donc le nom quand il est
+# deja present : on copie au niveau de la CATEGORIE, comme un torrent normal
+# (categorie/Nom/fichiers), a l'identique d'un download direct sur le NAS.
+#  - CAT       : dossier categorie qui doit CONTENIR l'entree du torrent.
+#  - FINAL_DIR : dossier que rtorrent doit pointer (d.directory).
+if [ -d "\$SRC" ]; then
+    if [ "\$(basename "\$DEST")" = "\$BASE" ]; then
+        CAT="\$(dirname "\$DEST")"
+    else
+        CAT="\$DEST"
+    fi
+    FINAL_DIR="\$CAT/\$BASE"
+else
+    CAT="\$DEST"
+    FINAL_DIR="\$CAT"
+fi
 
-# Copie SSD -> NAS. Deux exigences :
-#  1) PRESERVER LE MTIME : le fast-resume de rtorrent valide chaque fichier
-#     sur (taille + mtime). Un mtime different => rtorrent croit les donnees
-#     modifiees et re-hash tout le fichier (lent, inutile). On preserve donc
-#     le mtime pour que le seed reprenne tout de suite depuis le NAS.
-#  2) NE PAS TOUCHER AU PROPRIETAIRE : un chown echoue sur NFS en non-root
-#     (« Operation not permitted ») et ferait echouer la copie.
-# cp GNU (coreutils, present dans l'image) fait les deux en une passe via
-# --preserve=mode,timestamps. ATTENTION : sur Alpine, coreutils installe cp
-# en /bin/cp (PAS /usr/bin/cp) -> on appelle « cp » via le PATH, jamais un
-# chemin en dur (un /usr/bin/cp code en dur = "not found" => copie ratee =>
-# fichier non deplace). A defaut de cp GNU : copie simple puis restauration
-# des mtime avec touch -r (100% portable busybox).
+mkdir -p "\$CAT"
+log "[\$HASH] copie SSD -> NAS (seed en cours): \$SRC -> \$CAT/"
+
+# Copie SSD -> NAS. On PRESERVE UNIQUEMENT LE MTIME :
+#  - mtime preserve => le fast-resume de rtorrent valide (taille + mtime) et NE
+#    re-hash PAS le torrent apres le deplacement (sinon il relit tout, inutile) ;
+#  - on ne preserve NI le proprietaire (un chown echoue sur NFS en non-root) NI
+#    le mode : les fichiers/dossiers crees heritent des droits et du GROUPE du
+#    dossier parent sur le NAS (bit setgid du partage), exactement comme un
+#    download direct -> proprietaire/groupe identiques aux autres torrents.
+# cp GNU (coreutils) le fait via --preserve=timestamps. ATTENTION : sur Alpine,
+# coreutils installe cp en /bin/cp (PAS /usr/bin/cp) -> on appelle « cp » via le
+# PATH, jamais un chemin en dur (un /usr/bin/cp code en dur = "not found" =>
+# copie ratee => fichier non deplace). A defaut de cp GNU : copie simple puis
+# restauration des mtime avec touch -r (100% portable busybox).
 # Mesure taille + duree pour le journal (taille lue sur la source SSD).
 SIZE_KB=\$(du -sk "\$SRC" 2>/dev/null | awk '{print \$1}')
 T0=\$(date +%s)
 copy_ok=1
 if cp --version 2>/dev/null | grep -qi coreutils; then
-    cp -r --preserve=mode,timestamps "\$SRC" "\$DEST/" 2>>"\$LOG" && copy_ok=0
-elif cp -r "\$SRC" "\$DEST/" 2>>"\$LOG"; then
+    cp -r --preserve=timestamps "\$SRC" "\$CAT/" 2>>"\$LOG" && copy_ok=0
+elif cp -r "\$SRC" "\$CAT/" 2>>"\$LOG"; then
     if [ -d "\$SRC" ]; then
-        ( cd "\$SRC" && find . -exec touch -r "{}" "\$DEST/\$BASE/{}" \; ) 2>>"\$LOG"
+        ( cd "\$SRC" && find . -exec touch -r "{}" "\$CAT/\$BASE/{}" \; ) 2>>"\$LOG"
     else
-        touch -r "\$SRC" "\$DEST/\$BASE" 2>>"\$LOG"
+        touch -r "\$SRC" "\$CAT/\$BASE" 2>>"\$LOG"
     fi
     copy_ok=0
 fi
@@ -623,15 +642,15 @@ if [ "\$copy_ok" = 0 ]; then
     # Donnees a plat sur le NAS : bascule breve (torrent seedait -> rien a vider)
     rpc d.stop "\$HASH"
     rpc d.close "\$HASH"
-    rpc d.directory.set "\$HASH" "\$DEST"
+    rpc d.directory.set "\$HASH" "\$FINAL_DIR"
     rpc d.start "\$HASH"
     rpc d.save_full_session "\$HASH"
     rm -rf "\$SRC"
-    log "[\$HASH] OK: seed depuis \$DEST/\$BASE"
+    log "[\$HASH] OK: seed depuis \$CAT/\$BASE"
 else
     # Copie partielle nettoyee ; le torrent continue de seeder depuis le SSD
     # (il n'a jamais ete stoppe) : aucune perte, on retentera au besoin.
-    rm -rf "\${DEST:?}/\${BASE:?}" 2>/dev/null
+    rm -rf "\${CAT:?}/\${BASE:?}" 2>/dev/null
     log "[\$HASH] ERREUR: copie vers le NAS echouee (place disque ? montage ?)"
     log "[\$HASH]         le torrent seede depuis le disque temporaire en attendant"
 fi
