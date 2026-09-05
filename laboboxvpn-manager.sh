@@ -50,14 +50,14 @@ MAX_TORRENT_SIZE="6597069766656"
 # Propagé au docker-compose de chaque client (pas de rebuild : recréer le
 # conteneur suffit). 3 presets (leger/moyen/large) ou "perso" (valeurs à la
 # main). Ces réglages ne touchent PAS DHT/PEX (désactivés à part, pour les
-# trackers privés). Défaut = large (mêmes valeurs que l'image).
-PERF_PROFILE="large"
-RT_MIN_PEERS="40"
-RT_MAX_PEERS="200"
-RT_MIN_PEERS_SEED="30"
-RT_MAX_PEERS_SEED="200"
-RT_MAX_UPLOADS="20"
-RT_MAX_UPLOADS_GLOBAL="400"
+# trackers privés). Défaut = moyen (réglages éprouvés en prod : bon down/up).
+PERF_PROFILE="moyen"
+RT_MIN_PEERS="1"
+RT_MAX_PEERS="100"
+RT_MIN_PEERS_SEED="1"
+RT_MAX_PEERS_SEED="50"
+RT_MAX_UPLOADS="15"
+RT_MAX_UPLOADS_GLOBAL="300"
 RT_MAX_DOWNLOADS="16"
 RT_MAX_DOWNLOADS_GLOBAL="250"
 
@@ -2582,65 +2582,6 @@ cmd_bench_all() {
 }
 
 ###########################################
-# DÉMARRAGE AUTOMATIQUE AU BOOT
-###########################################
-# Les docker-compose sont volontairement en « restart: no » : l'ordre
-# compte (NFS monté → Gluetun healthy → rtorrent). Ce service rejoue donc
-# le démarrage séquentiel complet après le réseau, les montages distants
-# et Docker — la seedbox redevient opérationnelle seule après une coupure.
-
-SEEDBOX_SERVICE_FILE="/etc/systemd/system/labobox-seedbox.service"
-
-is_autostart_enabled() {
-    systemctl is-enabled --quiet labobox-seedbox.service 2>/dev/null
-}
-
-cmd_autostart_enable() {
-    print_header_with_title "DÉMARRAGE AUTO AU BOOT"
-
-    cat > "$SEEDBOX_SERVICE_FILE" << EOF
-[Unit]
-Description=LaboBox-VPN — démarrage séquentiel de la seedbox au boot
-# Après le réseau, les montages _netdev (NFS) et Docker. Le démarrage
-# séquentiel remonte de toute façon lui-même les partages manquants.
-After=network-online.target remote-fs.target docker.service
-Wants=network-online.target remote-fs.target
-Requires=docker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-# Chaque client attend son healthcheck Gluetun : marge large.
-TimeoutStartSec=1800
-ExecStart=/bin/bash ${INSTALL_DIR}/laboboxvpn-manager.sh sequential-start
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload 2>/dev/null
-    if systemctl enable labobox-seedbox.service >/dev/null 2>&1; then
-        print_item "Service" "labobox-seedbox.service"
-        print_item "Déclenchement" "à chaque boot, après réseau + NFS + Docker"
-        print_item_last "Suivi" "journalctl -u labobox-seedbox"
-        print_success_box "DÉMARRAGE AUTO ACTIVÉ"
-    else
-        print_error_box "Impossible d'activer le service (systemd indisponible ?)"
-        rm -f "$SEEDBOX_SERVICE_FILE"
-        return 1
-    fi
-    print_footer
-}
-
-cmd_autostart_disable() {
-    print_header_with_title "DÉMARRAGE AUTO AU BOOT"
-    systemctl disable labobox-seedbox.service >/dev/null 2>&1 || true
-    rm -f "$SEEDBOX_SERVICE_FILE"
-    systemctl daemon-reload 2>/dev/null || true
-    print_success "Démarrage auto désactivé (les clients ne démarreront plus seuls au boot)."
-    print_footer
-}
-
-###########################################
 # COMMANDE: INIT
 ###########################################
 cmd_init() {
@@ -2920,22 +2861,23 @@ cmd_migrate_sessions() {
 perf_set_preset() {
     case "$1" in
         leger)
-            RT_MIN_PEERS=10;  RT_MAX_PEERS=60
-            RT_MIN_PEERS_SEED=4;  RT_MAX_PEERS_SEED=30
-            RT_MAX_UPLOADS=4;  RT_MAX_UPLOADS_GLOBAL=100
-            RT_MAX_DOWNLOADS=8;  RT_MAX_DOWNLOADS_GLOBAL=100
+            RT_MIN_PEERS=1;   RT_MAX_PEERS=60
+            RT_MIN_PEERS_SEED=1;  RT_MAX_PEERS_SEED=25
+            RT_MAX_UPLOADS=6;  RT_MAX_UPLOADS_GLOBAL=150
+            RT_MAX_DOWNLOADS=8;  RT_MAX_DOWNLOADS_GLOBAL=150
             PERF_PROFILE=leger ;;
         moyen)
-            RT_MIN_PEERS=25;  RT_MAX_PEERS=120
-            RT_MIN_PEERS_SEED=15;  RT_MAX_PEERS_SEED=80
-            RT_MAX_UPLOADS=10;  RT_MAX_UPLOADS_GLOBAL=250
+            # = réglages éprouvés en prod (bon down/up) : 100/50 peers, 15 upload
+            RT_MIN_PEERS=1;   RT_MAX_PEERS=100
+            RT_MIN_PEERS_SEED=1;  RT_MAX_PEERS_SEED=50
+            RT_MAX_UPLOADS=15;  RT_MAX_UPLOADS_GLOBAL=300
             RT_MAX_DOWNLOADS=16;  RT_MAX_DOWNLOADS_GLOBAL=250
             PERF_PROFILE=moyen ;;
         large)
-            RT_MIN_PEERS=40;  RT_MAX_PEERS=200
-            RT_MIN_PEERS_SEED=30;  RT_MAX_PEERS_SEED=200
-            RT_MAX_UPLOADS=20;  RT_MAX_UPLOADS_GLOBAL=400
-            RT_MAX_DOWNLOADS=16;  RT_MAX_DOWNLOADS_GLOBAL=250
+            RT_MIN_PEERS=20;  RT_MAX_PEERS=200
+            RT_MIN_PEERS_SEED=10;  RT_MAX_PEERS_SEED=150
+            RT_MAX_UPLOADS=25;  RT_MAX_UPLOADS_GLOBAL=500
+            RT_MAX_DOWNLOADS=24;  RT_MAX_DOWNLOADS_GLOBAL=400
             PERF_PROFILE=large ;;
     esac
 }
@@ -2995,17 +2937,18 @@ perf_show_table() {
     echo ""
     echo -e "  ${WHITE}Comparaison des profils${NC}"
     echo ""
-    printf "  %-26s %9s %9s %9s\n" "" "Leger" "Moyen" "Large"
-    printf "  %-26s %9s %9s %9s\n" "Peers download (min/max)" "10/60" "25/120" "40/200"
-    printf "  %-26s %9s %9s %9s\n" "Peers seed (min/max)" "4/30" "15/80" "30/200"
-    printf "  %-26s %9s %9s %9s\n" "Upload /torrent" "4" "10" "20"
-    printf "  %-26s %9s %9s %9s\n" "Upload global" "100" "250" "400"
-    printf "  %-26s %9s %9s %9s\n" "Download /torrent" "8" "16" "16"
-    printf "  %-26s %9s %9s %9s\n" "Download global" "100" "250" "250"
+    printf "  %-26s %9s %9s %9s\n" "" "Leger" "Moyen*" "Large"
+    printf "  %-26s %9s %9s %9s\n" "Peers download (min/max)" "1/60" "1/100" "20/200"
+    printf "  %-26s %9s %9s %9s\n" "Peers seed (min/max)" "1/25" "1/50" "10/150"
+    printf "  %-26s %9s %9s %9s\n" "Upload /torrent" "6" "15" "25"
+    printf "  %-26s %9s %9s %9s\n" "Upload global" "150" "300" "500"
+    printf "  %-26s %9s %9s %9s\n" "Download /torrent" "8" "16" "24"
+    printf "  %-26s %9s %9s %9s\n" "Download global" "150" "250" "400"
     echo ""
-    echo -e "  ${DIM}Leger : menage les HDD du NAS (peu de flux). Large : upload max sur${NC}"
-    echo -e "  ${DIM}les releases populaires. L'upload depend surtout de la DEMANDE${NC}"
-    echo -e "  ${DIM}(leechers) et d'un port ouvert. DHT/PEX restent off (trackers prives).${NC}"
+    echo -e "  ${DIM}* Moyen = réglages éprouvés en prod (bon down/up) — profil par défaut.${NC}"
+    echo -e "  ${DIM}Leger : ménage les HDD du NAS (peu de flux). Large : plus de peers/slots${NC}"
+    echo -e "  ${DIM}mais l'upload dépend surtout de la DEMANDE (leechers) + port ouvert, et${NC}"
+    echo -e "  ${DIM}charge plus l'array. DHT/PEX restent off (trackers privés).${NC}"
 }
 
 # Enregistre + propage + propose la recréation des conteneurs.
@@ -3955,9 +3898,10 @@ cmd_uninstall() {
     done
     rm -rf "$INSTALL_DIR/apps" 2>/dev/null || true
     rm -f /etc/logrotate.d/laboboxvpn 2>/dev/null || true
-    # Service de démarrage auto (s'il avait été activé)
+    # Ancien service de démarrage auto (s'il avait été activé par une version
+    # précédente) : nettoyage défensif, la fonctionnalité a été retirée.
     systemctl disable --now labobox-seedbox.service >/dev/null 2>&1 || true
-    rm -f "$SEEDBOX_SERVICE_FILE" 2>/dev/null || true
+    rm -f /etc/systemd/system/labobox-seedbox.service 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
     echo -e "\r  ${DIM}[${step}/${total_steps}]${NC} Suppression de la configuration ${DIM}...${NC} ${GREEN}✔${NC}"
     
@@ -4012,8 +3956,8 @@ cmd_help() {
     echo -e "  ${WHITE}mount${NC}           Monter les partages NAS"
     echo -e "  ${WHITE}health${NC}          Diagnostic complet"
     echo -e "  ${WHITE}check-ports${NC}     Vérifier le port forwarding [client]"
-    echo -e "  ${WHITE}autostart-enable${NC}   Démarrage auto de la seedbox au boot"
-    echo -e "  ${WHITE}autostart-disable${NC}  Désactiver le démarrage auto"
+    echo -e "  ${WHITE}repair${NC}          Réparer un client qui ne démarre pas [client]"
+    echo -e "  ${WHITE}change-vpn${NC}      Changer la config VPN d'un client (--USER --VPN_CONFIG)"
     echo ""
     echo -e "  ${WHITE}PERFORMANCE${NC}"
     line
@@ -6400,6 +6344,130 @@ interactive_repair_client() {
     press_enter
 }
 
+###########################################
+# CHANGER LA CONFIG VPN D'UN CLIENT
+###########################################
+# Remplace les valeurs WIREGUARD_* dans le docker-compose du client à partir
+# d'un nouveau fichier .conf, puis recrée le conteneur. Évite de re-créer tout
+# le client (données/torrents sur le NAS intactes). Utile quand une clé VPN est
+# révoquée / rejetée par le fournisseur.
+cmd_change_vpn() {
+    local CLIENT="$1"
+    local VPN_CONFIG="$2"
+    if [ -z "$CLIENT" ] || [ -z "$VPN_CONFIG" ]; then
+        print_error_box "Usage : change-vpn --USER=<client> --VPN_CONFIG=<fichier.conf>"
+        return 1
+    fi
+    if ! client_exists "$CLIENT"; then
+        print_error_box "Le client '${CLIENT}' n'existe pas."
+        return 1
+    fi
+    if [ ! -f "$VPN_CONFIG" ]; then
+        print_error_box "Fichier VPN introuvable : ${VPN_CONFIG}"
+        return 1
+    fi
+    local compose="$CLIENTS_DIR/$CLIENT/docker-compose.yml"
+    if [ ! -f "$compose" ]; then
+        print_error_box "docker-compose.yml introuvable pour ${CLIENT}."
+        return 1
+    fi
+
+    print_header_with_title "CHANGER LA CONFIG VPN : ${CLIENT}"
+
+    # Parse le nouveau .conf WireGuard (même logique que 'add')
+    local WG_PRIVATE_KEY WG_ADDRESS WG_PUBLIC_KEY WG_PRESHARED_KEY WG_ENDPOINT WG_ENDPOINT_IP WG_ENDPOINT_PORT
+    WG_PRIVATE_KEY=$(grep -i "PrivateKey"   "$VPN_CONFIG" | cut -d'=' -f2- | tr -d ' ')
+    WG_ADDRESS=$(grep -i "Address"          "$VPN_CONFIG" | cut -d'=' -f2- | tr -d ' ')
+    WG_PUBLIC_KEY=$(grep -i "PublicKey"     "$VPN_CONFIG" | cut -d'=' -f2- | tr -d ' ')
+    WG_PRESHARED_KEY=$(grep -i "PresharedKey" "$VPN_CONFIG" | cut -d'=' -f2- | tr -d ' ' || echo "")
+    WG_ENDPOINT=$(grep -i "Endpoint"        "$VPN_CONFIG" | cut -d'=' -f2- | tr -d ' ')
+    WG_ENDPOINT_IP=$(echo "$WG_ENDPOINT" | cut -d':' -f1)
+    WG_ENDPOINT_PORT=$(echo "$WG_ENDPOINT" | cut -d':' -f2)
+
+    if [ -z "$WG_PRIVATE_KEY" ] || [ -z "$WG_PUBLIC_KEY" ] || [ -z "$WG_ENDPOINT_IP" ] || [ -z "$WG_ADDRESS" ]; then
+        print_error_box "Config WireGuard incomplète (PrivateKey/PublicKey/Endpoint/Address manquant)."
+        return 1
+    fi
+
+    print_item "Endpoint" "${WG_ENDPOINT_IP}:${WG_ENDPOINT_PORT}"
+    print_item "Adresse tunnel" "${WG_ADDRESS}"
+    print_item_last "Clé publique" "${WG_PUBLIC_KEY:0:16}…"
+    echo ""
+
+    # Remplace chaque WIREGUARD_* dans le compose (délimiteur sed = | ; les
+    # valeurs base64/IP ne contiennent pas de |, mais on échappe & et \ par
+    # sécurité côté remplacement).
+    _cv_set() {
+        local k="$1" v="$2"
+        v="${v//\\/\\\\}"; v="${v//&/\\&}"; v="${v//|/\\|}"
+        if grep -q "      - ${k}=" "$compose"; then
+            sed -i "s|      - ${k}=.*|      - ${k}=${v}|" "$compose"
+        else
+            sed -i "\|- WIREGUARD_ENDPOINT_IP=|a\\      - ${k}=${v}" "$compose"
+        fi
+    }
+    _cv_set WIREGUARD_ENDPOINT_IP   "$WG_ENDPOINT_IP"
+    _cv_set WIREGUARD_ENDPOINT_PORT "$WG_ENDPOINT_PORT"
+    _cv_set WIREGUARD_PUBLIC_KEY    "$WG_PUBLIC_KEY"
+    _cv_set WIREGUARD_PRIVATE_KEY   "$WG_PRIVATE_KEY"
+    _cv_set WIREGUARD_PRESHARED_KEY "$WG_PRESHARED_KEY"
+    _cv_set WIREGUARD_ADDRESSES     "$WG_ADDRESS"
+    echo -e "  ${GREEN}✔${NC} Config VPN mise à jour dans le docker-compose"
+
+    # Recrée le conteneur pour appliquer la nouvelle config
+    mount_nas_for_client "$CLIENT" 2>/dev/null || true
+    ( cd "$CLIENTS_DIR/$CLIENT" && docker compose up -d >/dev/null 2>&1 )
+
+    local elapsed=0 health=""
+    echo -ne "  gluetun: ${DIM}attente healthcheck...${NC}"
+    while [ $elapsed -lt $STARTUP_HEALTHCHECK_TIMEOUT ]; do
+        health=$(docker inspect --format='{{.State.Health.Status}}' "gluetun-$CLIENT" 2>/dev/null)
+        [ "$health" = "healthy" ] && break
+        sleep 2; elapsed=$((elapsed + 2))
+        echo -ne "\r  gluetun: ${DIM}attente healthcheck... ${elapsed}s${NC}   "
+    done
+    if [ "$health" = "healthy" ]; then
+        local ip; ip=$(get_vpn_ip "$CLIENT" 2>/dev/null); [ -z "$ip" ] && ip="connecté"
+        echo -e "\r  gluetun: ${GREEN}✔${NC} healthy (IP ${ip})                    "
+        print_success_box "CONFIG VPN CHANGÉE POUR ${CLIENT}"
+    else
+        echo -e "\r  gluetun: ${RED}✗${NC} pas healthy après ${STARTUP_HEALTHCHECK_TIMEOUT}s          "
+        echo -e "  ${DIM}     Dernières lignes du log gluetun :${NC}"
+        docker logs --tail 8 "gluetun-$CLIENT" 2>&1 | sed 's/^/       /'
+        print_error_box "Le VPN ne monte pas avec cette config — vérifie le .conf"
+    fi
+    print_footer
+}
+
+interactive_change_vpn_client() {
+    print_menu_header
+
+    local clients=$(get_clients)
+    if [ -z "$clients" ]; then
+        echo -e "  ${DIM}Aucun client configuré.${NC}"
+        press_enter
+        return
+    fi
+
+    echo -e "  ${WHITE}CHANGER LA CONFIG VPN D'UN CLIENT${NC}"
+    line
+    echo ""
+    echo -e "  ${DIM}Remplace la config WireGuard d'un client par un nouveau .conf, puis${NC}"
+    echo -e "  ${DIM}recrée son conteneur. Données et torrents (sur le NAS) intacts.${NC}"
+    echo ""
+    echo -e "  ${DIM}Clients : $(echo $clients | tr '\n' ' ')${NC}"
+    echo ""
+    echo -ne "  Nom du client : "
+    read client_name
+    [ -z "$client_name" ] && { echo -e "  ${DIM}Annulé.${NC}"; press_enter; return; }
+    echo -ne "  Chemin du fichier .conf WireGuard : "
+    read vpn_path
+    [ -z "$vpn_path" ] && { echo -e "  ${DIM}Annulé.${NC}"; press_enter; return; }
+
+    cmd_change_vpn "$client_name" "$vpn_path"
+    press_enter
+}
+
 interactive_stop_client() {
     print_menu_header
 
@@ -6594,15 +6662,12 @@ interactive_maintenance_menu() {
         print_menu_option "7" "-" "Démarrage complet séquentiel"
         print_menu_option "8" "-" "Arrêt complet séquentiel"
         print_menu_option "9" "-" "Réparer un client qui ne démarre pas"
+        print_menu_option "10" "-" "Changer la config VPN d'un client"
         print_menu_separator
-        local autostart_label="Activer le démarrage auto au boot"
-        is_autostart_enabled && autostart_label="Désactiver le démarrage auto au boot ${GREEN}(actif)${NC}"
-
-        print_menu_option "10" "-" "Monter tous les partages NAS"
-        print_menu_option "11" "-" "Optimisation réseau & stockage NFS"
-        print_menu_option "12" "-" "Performance rtorrent (peers / upload)"
-        print_menu_option "13" "-" "Activer / Désactiver le disque SSD temporaire"
-        print_menu_option "14" "-" "$(echo -e "$autostart_label")"
+        print_menu_option "11" "-" "Monter tous les partages NAS"
+        print_menu_option "12" "-" "Optimisation réseau & stockage NFS"
+        print_menu_option "13" "-" "Performance rtorrent (peers / upload)"
+        print_menu_option "14" "-" "Activer / Désactiver le disque SSD temporaire"
         print_menu_separator
         print_menu_option "15" "-" "Désinstaller tout"
         print_menu_separator
@@ -6638,18 +6703,11 @@ interactive_maintenance_menu() {
             7) cmd_sequential_start; press_enter ;;
             8) cmd_sequential_stop; press_enter ;;
             9) interactive_repair_client ;;
-            10) cmd_mount; press_enter ;;
-            11) interactive_network_optimize_menu ;;
-            12) interactive_perf_menu ;;
-            13) interactive_temp_toggle ;;
-            14)
-                if is_autostart_enabled; then
-                    cmd_autostart_disable
-                else
-                    cmd_autostart_enable
-                fi
-                press_enter
-                ;;
+            10) interactive_change_vpn_client ;;
+            11) cmd_mount; press_enter ;;
+            12) interactive_network_optimize_menu ;;
+            13) interactive_perf_menu ;;
+            14) interactive_temp_toggle ;;
             15) cmd_uninstall; press_enter ;;
             0|q|Q) return ;;
             *) ;;
@@ -6809,6 +6867,12 @@ case "${1}" in
         CLIENT="${ARG_USER:-${OTHER_ARGS[0]}}"
         cmd_repair "$CLIENT"
         ;;
+    change-vpn)
+        shift
+        parse_args "$@"
+        CLIENT="${ARG_USER:-${OTHER_ARGS[0]}}"
+        cmd_change_vpn "$CLIENT" "$ARG_VPN_CONFIG"
+        ;;
     logs)
         shift
         parse_args "$@"
@@ -6883,12 +6947,6 @@ case "${1}" in
         shift
         parse_args "$@"
         cmd_bench_vpn "${ARG_USER:-${OTHER_ARGS[0]:-}}"
-        ;;
-    autostart-enable)
-        cmd_autostart_enable
-        ;;
-    autostart-disable)
-        cmd_autostart_disable
         ;;
     temp-enable)
         shift

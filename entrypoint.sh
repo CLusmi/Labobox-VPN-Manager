@@ -53,27 +53,24 @@ RT_MAX_OPEN_FILES="${RT_MAX_OPEN_FILES:-3072}"
 RT_MAX_OPEN_SOCKETS="${RT_MAX_OPEN_SOCKETS:-1500}"
 
 # --- Peers (par torrent) ---
-# Profil SEED AGRESSIF (trackers prives, port ouvert) : on maximise le nombre de
-# leechers servis simultanement. Utile SURTOUT sur les torrents populaires (une
-# release fraiche avec beaucoup de leechers) ; sur un torrent a 3 leechers, plus
-# de slots ne change rien (l'upload depend de la DEMANDE, pas de la config).
-#  * NORMAL (EN TELECHARGEMENT) : ecritures sur le SSD -> on ouvre grand.
-#  * SEED (TERMINE) : lectures sur le NAS (disques mecaniques). On monte haut
-#    pour l'upload ; contrepartie = plus de lectures aleatoires sur l'array (si
-#    le NAS peine, redescendre RT_MAX_PEERS_SEED / RT_MAX_UPLOADS).
+# Valeurs par DEFAUT = profil "moyen" (reglages eprouves en prod : bon down/up).
+# Elles ne s'appliquent que si le docker-compose du client ne fournit pas les
+# RT_* (le manager les injecte via le menu Performance). L'upload depend surtout
+# de la DEMANDE (leechers) + d'un port ouvert : plus de peers/slots aide sur les
+# releases populaires mais charge davantage l'array du NAS.
 # NB trackers prives : DHT/PEX/LSD restent DESACTIVES (sinon risque de ban).
-RT_MIN_PEERS="${RT_MIN_PEERS:-40}"
-RT_MAX_PEERS="${RT_MAX_PEERS:-200}"
-RT_MIN_PEERS_SEED="${RT_MIN_PEERS_SEED:-30}"
-RT_MAX_PEERS_SEED="${RT_MAX_PEERS_SEED:-200}"
+RT_MIN_PEERS="${RT_MIN_PEERS:-1}"
+RT_MAX_PEERS="${RT_MAX_PEERS:-100}"
+RT_MIN_PEERS_SEED="${RT_MIN_PEERS_SEED:-1}"
+RT_MAX_PEERS_SEED="${RT_MAX_PEERS_SEED:-50}"
 
 # --- Slots (= flux d'IO simultanes) ---
 # max_uploads par torrent = nombre de leechers servis EN MEME TEMPS sur un meme
 # torrent : c'est le levier le plus direct sur l'upload d'une release populaire.
 # Contrepartie : autant de lectures aleatoires simultanees sur le NAS.
-RT_MAX_UPLOADS_GLOBAL="${RT_MAX_UPLOADS_GLOBAL:-400}"
+RT_MAX_UPLOADS_GLOBAL="${RT_MAX_UPLOADS_GLOBAL:-300}"
 RT_MAX_DOWNLOADS_GLOBAL="${RT_MAX_DOWNLOADS_GLOBAL:-250}"
-RT_MAX_UPLOADS="${RT_MAX_UPLOADS:-20}"
+RT_MAX_UPLOADS="${RT_MAX_UPLOADS:-15}"
 RT_MAX_DOWNLOADS="${RT_MAX_DOWNLOADS:-16}"
 
 # --- Taille max d'un torrent accepte (garde-fou) ---
