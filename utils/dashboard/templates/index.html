@@ -1400,6 +1400,10 @@
         .disk-meter-fill.warning { background: var(--accent-amber); }
         .disk-meter-fill.danger { background: var(--accent-red); }
         .disk-meter-note { margin-top: 0.35rem; font-size: 0.7rem; color: var(--text-muted); }
+        .disk-meter-io { margin-top: 0.3rem; font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; color: var(--text-muted); }
+        .disk-meter-io b { color: var(--text-secondary); font-weight: 600; }
+        .disk-meter-io .r { color: var(--accent-cyan); }
+        .disk-meter-io .w { color: var(--accent-amber); }
 
         /* ==================== TOAST NOTIFICATIONS ==================== */
         .toast-container {
@@ -2562,6 +2566,7 @@
                             </div>
                             <div class="disk-meter-bar"><div class="disk-meter-fill {{if gt .System.NASPercent 80.0}}warning{{end}}{{if gt .System.NASPercent 90.0}} danger{{end}}" style="width: {{if .System.NASOnline}}{{printf "%.0f" .System.NASPercent}}{{else}}0{{end}}%"></div></div>
                             <div class="disk-meter-note">{{if .System.NASOnline}}{{formatBytes .System.NASUsed}} / {{formatBytes .System.NASTotal}} · cumul des partages clients{{else}}NAS non monté sur /mnt/nas{{end}}</div>
+                            {{if .System.NASOnline}}<div class="disk-meter-io">Lecture <b class="r">{{formatSpeed .System.NASReadBps}}</b> · Écriture <b class="w">{{formatSpeed .System.NASWriteBps}}</b></div>{{end}}
                         </div>
                         {{if .System.SSDConfigured}}
                         <div class="disk-meter">
@@ -2571,6 +2576,7 @@
                             </div>
                             <div class="disk-meter-bar"><div class="disk-meter-fill {{if gt .System.SSDPercent 80.0}}warning{{end}}{{if gt .System.SSDPercent 90.0}} danger{{end}}" style="width: {{printf "%.0f" .System.SSDPercent}}%"></div></div>
                             <div class="disk-meter-note">{{formatBytes .System.SSDUsed}} / {{formatBytes .System.SSDTotal}} en transit</div>
+                            <div class="disk-meter-io">Lecture <b class="r">{{formatSpeed .System.SSDReadBps}}</b> · Écriture <b class="w">{{formatSpeed .System.SSDWriteBps}}</b></div>
                         </div>
                         {{end}}
                         <div class="disk-meter">
@@ -2580,6 +2586,7 @@
                             </div>
                             <div class="disk-meter-bar"><div class="disk-meter-fill {{if gt .System.DiskPercent 80.0}}warning{{end}}{{if gt .System.DiskPercent 90.0}} danger{{end}}" style="width: {{printf "%.0f" .System.DiskPercent}}%"></div></div>
                             <div class="disk-meter-note">{{formatBytes .System.DiskUsed}} / {{formatBytes .System.DiskTotal}}</div>
+                            <div class="disk-meter-io">Lecture <b class="r">{{formatSpeed .System.VMReadBps}}</b> · Écriture <b class="w">{{formatSpeed .System.VMWriteBps}}</b></div>
                         </div>
                     </div>
                 </div>

@@ -367,6 +367,14 @@ type SystemStats struct {
 	SSDTotal      int64   `json:"ssd_total"`
 	SSDPercent    float64 `json:"ssd_percent"`
 	SSDConfigured bool    `json:"ssd_configured"`
+	// Débit lecture/écriture par disque (octets/s), moyenné sur l'intervalle du
+	// collecteur. VM/SSD via /proc/diskstats ; NAS via /proc/self/mountstats (NFS).
+	VMReadBps   int64 `json:"vm_read_bps"`
+	VMWriteBps  int64 `json:"vm_write_bps"`
+	SSDReadBps  int64 `json:"ssd_read_bps"`
+	SSDWriteBps int64 `json:"ssd_write_bps"`
+	NASReadBps  int64 `json:"nas_read_bps"`
+	NASWriteBps int64 `json:"nas_write_bps"`
 }
 
 type LiveStats struct {
@@ -948,9 +956,15 @@ func collectSystem() SystemStats {
 			stats.MemoryPercent = float64(stats.MemoryUsed) / float64(memTotal) * 100
 		}
 	}
-	// Espace VM : disque système (/).
+	now := time.Now()
+	// Espace VM : disque système (/) + débit I/O (local, /proc/diskstats).
 	if used, total, pct, ok := dfStats("/"); ok {
 		stats.DiskUsed, stats.DiskTotal, stats.DiskPercent = used, total, pct
+	}
+	if dev := deviceForPath("/"); dev != "" {
+		if r, w, ok := readDiskstats(dev); ok {
+			stats.VMReadBps, stats.VMWriteBps = ioRate("dev:"+dev, r, w, now)
+		}
 	}
 	// Espace HDD : le NAS est monté par client sous /mnt/nas/<X> (il n'y a pas de
 	// point de montage unique sur /mnt/nas). On agrège les partages clients.
@@ -959,12 +973,21 @@ func collectSystem() SystemStats {
 		if total > 0 {
 			stats.NASPercent = float64(used) / float64(total) * 100
 		}
+		// Débit NFS (côté serveur) agrégé depuis /proc/self/mountstats.
+		if r, w, ok := readNFSBytes(); ok {
+			stats.NASReadBps, stats.NASWriteBps = ioRate("nas", r, w, now)
+		}
 	}
 	// Espace SSD : disque temporaire TEMP_DIR (laboboxvpn.conf) s'il est configuré.
 	if tempDir := readTempDir(); tempDir != "" {
 		stats.SSDConfigured = true
 		if used, total, pct, ok := dfStats(tempDir); ok {
 			stats.SSDUsed, stats.SSDTotal, stats.SSDPercent = used, total, pct
+		}
+		if dev := deviceForPath(tempDir); dev != "" {
+			if r, w, ok := readDiskstats(dev); ok {
+				stats.SSDReadBps, stats.SSDWriteBps = ioRate("dev:"+dev, r, w, now)
+			}
 		}
 	}
 	return stats
@@ -1090,6 +1113,130 @@ func readTempDir() string {
 		}
 	}
 	return ""
+}
+
+// ---- Débit disque (lecture/écriture) ----
+
+type diskSample struct {
+	read, write int64
+	t           time.Time
+}
+
+var (
+	diskIOMu   sync.Mutex
+	prevDiskIO = map[string]diskSample{}
+)
+
+// ioRate calcule le débit (octets/s) lecture/écriture pour une clé donnée à
+// partir de l'échantillon précédent. Premier appel ou compteur remis à zéro : 0.
+func ioRate(key string, read, write int64, now time.Time) (rBps, wBps int64) {
+	diskIOMu.Lock()
+	defer diskIOMu.Unlock()
+	prev, ok := prevDiskIO[key]
+	prevDiskIO[key] = diskSample{read: read, write: write, t: now}
+	if !ok {
+		return 0, 0
+	}
+	elapsed := now.Sub(prev.t).Seconds()
+	if elapsed <= 0 {
+		return 0, 0
+	}
+	if read >= prev.read {
+		rBps = int64(float64(read-prev.read) / elapsed)
+	}
+	if write >= prev.write {
+		wBps = int64(float64(write-prev.write) / elapsed)
+	}
+	return
+}
+
+// deviceForPath renvoie le nom de périphérique bloc (tel qu'affiché dans
+// /proc/diskstats, ex. « sda1 », « md0 ») du système de fichiers contenant
+// `path`, via le point de montage le plus spécifique de /proc/mounts. Renvoie
+// "" si ce n'est pas un périphérique /dev (ex. montage NFS).
+func deviceForPath(path string) string {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return ""
+	}
+	bestDev, bestLen := "", -1
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || !strings.HasPrefix(f[0], "/dev/") {
+			continue
+		}
+		mp := f[1]
+		if path == mp || strings.HasPrefix(path, strings.TrimRight(mp, "/")+"/") {
+			if len(mp) > bestLen {
+				bestLen = len(mp)
+				bestDev = strings.TrimPrefix(f[0], "/dev/")
+			}
+		}
+	}
+	return bestDev
+}
+
+// readDiskstats lit les octets cumulés lus/écrits d'un périphérique bloc dans
+// /proc/diskstats (secteurs de 512 octets).
+func readDiskstats(dev string) (readBytes, writeBytes int64, ok bool) {
+	data, err := os.ReadFile("/proc/diskstats")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 10 || f[2] != dev {
+			continue
+		}
+		secR, _ := strconv.ParseInt(f[5], 10, 64) // secteurs lus
+		secW, _ := strconv.ParseInt(f[9], 10, 64) // secteurs écrits
+		return secR * 512, secW * 512, true
+	}
+	return
+}
+
+// readNFSBytes agrège les octets lus/écrits côté serveur NFS depuis
+// /proc/self/mountstats, dédupliqués par export source (un même export monté
+// plusieurs fois partage les mêmes compteurs).
+func readNFSBytes() (readBytes, writeBytes int64, ok bool) {
+	data, err := os.ReadFile("/proc/self/mountstats")
+	if err != nil {
+		return
+	}
+	seen := map[string]bool{}
+	curSrc, curIsNFS := "", false
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "device ") {
+			// "device <src> mounted on <mp> with fstype <fs> ..."
+			f := strings.Fields(line)
+			curSrc, curIsNFS = "", false
+			if len(f) >= 8 {
+				curSrc = f[1]
+				for i := 4; i < len(f)-1; i++ {
+					if f[i] == "fstype" {
+						curIsNFS = f[i+1] == "nfs" || f[i+1] == "nfs4"
+						break
+					}
+				}
+			}
+			continue
+		}
+		if !curIsNFS || seen[curSrc] {
+			continue
+		}
+		if t := strings.TrimSpace(line); strings.HasPrefix(t, "bytes:") {
+			nums := strings.Fields(strings.TrimPrefix(t, "bytes:"))
+			if len(nums) >= 6 {
+				sr, _ := strconv.ParseInt(nums[4], 10, 64) // octets lus depuis le serveur
+				sw, _ := strconv.ParseInt(nums[5], 10, 64) // octets écrits vers le serveur
+				readBytes += sr
+				writeBytes += sw
+				seen[curSrc] = true
+				ok = true
+			}
+		}
+	}
+	return
 }
 
 var allowedActions = map[string]bool{
