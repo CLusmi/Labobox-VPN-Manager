@@ -2571,7 +2571,7 @@
                         {{if .System.SSDConfigured}}
                         <div class="disk-meter">
                             <div class="disk-meter-lab">
-                                <span class="disk-meter-k">Espace SSD</span>
+                                <span class="disk-meter-k">Espace NVMe</span>
                                 <span class="disk-meter-v {{if gt .System.SSDPercent 80.0}}warn{{end}}{{if gt .System.SSDPercent 90.0}} danger{{end}}">{{printf "%.0f" .System.SSDPercent}}%</span>
                             </div>
                             <div class="disk-meter-bar"><div class="disk-meter-fill {{if gt .System.SSDPercent 80.0}}warning{{end}}{{if gt .System.SSDPercent 90.0}} danger{{end}}" style="width: {{printf "%.0f" .System.SSDPercent}}%"></div></div>
